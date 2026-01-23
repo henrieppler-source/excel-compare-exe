@@ -376,7 +376,7 @@ ttk.Button(frm, text="A ↔ B tauschen", command=swap_files).grid(
 )
 
 
-    def show_sheets():
+def show_sheets():
         try:
             a = list_sheets(fileA_path.get())
             b = list_sheets(fileB_path.get())
@@ -453,6 +453,7 @@ ttk.Button(frm, text="A ↔ B tauschen", command=swap_files).grid(
 
 if __name__ == "__main__":
     main_gui()
+
 
 
 

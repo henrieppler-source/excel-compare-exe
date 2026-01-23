@@ -3,20 +3,24 @@ import os
 import glob
 import tempfile
 from datetime import datetime
-import pandas as pd
 
+import pandas as pd
 import tkinter as tk
 from tkinter import ttk, messagebox
+
 
 # ---------------- Excel column helpers ----------------
 def col_to_index(col: str) -> int:
     col = col.strip().upper()
+    if not col:
+        raise ValueError("Leere Spaltenangabe.")
     n = 0
     for ch in col:
         if not ("A" <= ch <= "Z"):
             raise ValueError(f"Ungültige Spalte: {col}")
         n = n * 26 + (ord(ch) - ord("A") + 1)
     return n - 1
+
 
 def index_to_col(idx: int) -> str:
     idx += 1
@@ -25,6 +29,7 @@ def index_to_col(idx: int) -> str:
         idx, r = divmod(idx - 1, 26)
         res = chr(r + ord("A")) + res
     return res
+
 
 def parse_cols_spec(spec: str) -> list[str]:
     """
@@ -48,15 +53,13 @@ def parse_cols_spec(spec: str) -> list[str]:
             a, b = b, a
         return [index_to_col(i) for i in range(a, b + 1)]
 
-    parts = []
-    for token in s.replace(";", ",").split(","):
-        if token:
-            parts.append(token)
+    parts = [p for p in s.replace(";", ",").split(",") if p]
     if not parts:
         raise ValueError("Ungültige Spaltenliste. Beispiel: D,E,F oder D:I")
     for p in parts:
         _ = col_to_index(p)
     return parts
+
 
 # ---------------- Normalization ----------------
 def normalize_value(v):
@@ -69,6 +72,7 @@ def normalize_value(v):
     if isinstance(v, (pd.Timestamp, datetime)):
         return pd.Timestamp(v).date().isoformat()
     return str(v)
+
 
 # ---------------- Sheet resolution with validation ----------------
 def resolve_sheet_name(xl: pd.ExcelFile, sheet_spec: str | None) -> str:
@@ -85,6 +89,7 @@ def resolve_sheet_name(xl: pd.ExcelFile, sheet_spec: str | None) -> str:
         raise ValueError(f"Blatt '{s}' nicht gefunden. Vorhanden: {names}")
     return s
 
+
 # ---------------- Row mapping (header=None!) ----------------
 def excel_row_to_iloc(row_excel: int) -> int:
     """
@@ -93,12 +98,14 @@ def excel_row_to_iloc(row_excel: int) -> int:
     """
     return row_excel - 1
 
+
 def iloc_to_excel_row(iloc: int) -> int:
     return iloc + 1
 
+
 # ---------------- Read block from file (header=None) ----------------
 def read_block(path: str, sheet_spec: str, key_col: str, compare_cols: list[str],
-               row_start_excel: int, row_end_excel: int):
+               row_start_excel: int, row_end_excel: int) -> pd.DataFrame:
     xl = pd.ExcelFile(path)
     sheet_name = resolve_sheet_name(xl, sheet_spec)
 
@@ -120,6 +127,7 @@ def read_block(path: str, sheet_spec: str, key_col: str, compare_cols: list[str]
 
     start_i = excel_row_to_iloc(rs)
     end_i = excel_row_to_iloc(re)
+
     if start_i < 0:
         start_i = 0
     if end_i >= len(df):
@@ -133,8 +141,6 @@ def read_block(path: str, sheet_spec: str, key_col: str, compare_cols: list[str]
     block = df.iloc[start_i:end_i + 1].copy().reset_index(drop=False).rename(columns={"index": "_iloc"})
     block["_excel_row"] = block["_iloc"].apply(iloc_to_excel_row)
 
-    # select by position
-    vals = block.iloc[:, [block.columns.get_loc("_excel_row")] + [block.columns.get_loc("_iloc")]].copy()
     data = block.iloc[:, idxs].copy()
     data.columns = needed
 
@@ -151,12 +157,17 @@ def read_block(path: str, sheet_spec: str, key_col: str, compare_cols: list[str]
     out.attrs["file_name"] = os.path.basename(path)
     return out
 
+
 # ---------------- Compare blocks ----------------
 def make_payload(row, compare_cols):
     return "|".join(str(row[c]) for c in compare_cols)
 
-def compare_blocks(a, b, key_col, compare_cols):
+
+def compare_blocks(a: pd.DataFrame, b: pd.DataFrame, key_col: str, compare_cols: list[str]) -> pd.DataFrame:
     # duplicates handled by occurrence index (#1, #2, ...)
+    a = a.copy()
+    b = b.copy()
+
     a["_dup"] = a.groupby(key_col).cumcount() + 1
     b["_dup"] = b.groupby(key_col).cumcount() + 1
     a["_key2"] = a[key_col].astype(str) + "#" + a["_dup"].astype(str)
@@ -178,9 +189,13 @@ def compare_blocks(a, b, key_col, compare_cols):
 
     # Per-column diff flags (only meaningful if both)
     for c in compare_cols:
-        m[f"DIFF_{c}"] = (m[f"{c}_A"].astype(str) != m[f"{c}_B"].astype(str)) & (m["_merge"] == "both")
+        m[f"DIFF_{c}"] = (
+            (m.get(f"{c}_A").astype(str) != m.get(f"{c}_B").astype(str))
+            & (m["_merge"] == "both")
+        )
 
     return m
+
 
 # ---------------- Produce text report ----------------
 def safe_write_path(preferred_dir: str, filename: str) -> str:
@@ -193,9 +208,9 @@ def safe_write_path(preferred_dir: str, filename: str) -> str:
     except Exception:
         return os.path.join(tempfile.gettempdir(), filename)
 
-def write_text_report(m, compare_cols, out_txt_path,
-                      fileA, sheetA, fileB, sheetB, key_col):
-    # Determine if identical
+
+def write_text_report(m: pd.DataFrame, compare_cols: list[str], out_txt_path: str,
+                      fileA: str, sheetA: str, fileB: str, sheetB: str, key_col: str) -> None:
     any_problem = (m["STATUS"] != "OK").any()
 
     lines = []
@@ -211,7 +226,6 @@ def write_text_report(m, compare_cols, out_txt_path,
             f.write("\n".join(lines))
         return
 
-    # Missing rows
     missA = m[m["STATUS"] == "FEHLT_IN_A"].copy()
     missB = m[m["STATUS"] == "FEHLT_IN_B"].copy()
 
@@ -220,7 +234,7 @@ def write_text_report(m, compare_cols, out_txt_path,
         for _, r in missA.iterrows():
             key = r.get(f"{key_col}_B", "")
             row_b = r.get("_excel_row_B", "")
-            occ = str(r.get("_key2","")).split("#")[-1]
+            occ = str(r.get("_key2", "")).split("#")[-1]
             lines.append(f"  Key={key} (#{occ}): {fileB} {sheetB} Zeile {row_b}")
         lines.append("")
 
@@ -229,17 +243,16 @@ def write_text_report(m, compare_cols, out_txt_path,
         for _, r in missB.iterrows():
             key = r.get(f"{key_col}_A", "")
             row_a = r.get("_excel_row_A", "")
-            occ = str(r.get("_key2","")).split("#")[-1]
+            occ = str(r.get("_key2", "")).split("#")[-1]
             lines.append(f"  Key={key} (#{occ}): {fileA} {sheetA} Zeile {row_a}")
         lines.append("")
 
-    # Cell-level differences
     diffs = m[m["STATUS"] == "ABWEICHUNG"].copy()
     if not diffs.empty:
         lines.append("ABWEICHUNGEN (Datei Blatt Zelle: Wert / Datei Blatt Zelle: Wert):")
         for _, r in diffs.iterrows():
             key = r.get(f"{key_col}_A", "")
-            occ = str(r.get("_key2","")).split("#")[-1]
+            occ = str(r.get("_key2", "")).split("#")[-1]
             row_a = int(r.get("_excel_row_A")) if pd.notna(r.get("_excel_row_A")) else None
             row_b = int(r.get("_excel_row_B")) if pd.notna(r.get("_excel_row_B")) else None
 
@@ -258,18 +271,29 @@ def write_text_report(m, compare_cols, out_txt_path,
     with open(out_txt_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
-# ---------------- Run compare with GUI inputs ----------------
-def pick_two_xlsx(folder):
+
+# ---------------- File picking ----------------
+def pick_two_xlsx(folder: str) -> tuple[str, str]:
     files = sorted(glob.glob(os.path.join(folder, "*.xlsx")))
     files = [f for f in files if not os.path.basename(f).lower().startswith("pruefprotokoll")]
     if len(files) != 2:
         raise RuntimeError(f"Im Ordner müssen genau 2 XLSX-Dateien liegen (gefunden: {len(files)}).")
     return files[0], files[1]
 
-def run_compare(fileA_path, fileB_path,
-                sheetA_spec, cols_spec, startA, endA, keyA,
-                sheetB_spec, cols_specB, startB, endB, keyB):
-    # Key must be same on both
+
+def list_sheets(path: str) -> str:
+    xl = pd.ExcelFile(path)
+    names = xl.sheet_names
+    out = [f"{os.path.basename(path)} (Blätter: {len(names)})"]
+    for i, n in enumerate(names, start=1):
+        out.append(f"  {i}: {n}")
+    return "\n".join(out)
+
+
+# ---------------- Compare runner ----------------
+def run_compare(fileA_path: str, fileB_path: str,
+                sheetA_spec: str, cols_spec: str, startA: str, endA: str, keyA: str,
+                sheetB_spec: str, cols_specB: str, startB: str, endB: str, keyB: str):
     keyA = keyA.strip().upper()
     keyB = keyB.strip().upper()
     if keyA != keyB:
@@ -283,10 +307,10 @@ def run_compare(fileA_path, fileB_path,
         raise ValueError("Prüfspalten müssen in beiden Dateien identisch sein (z.B. überall D:I).")
     compare_cols = compare_colsA
 
-    # validate row numbers
     for v, name in [(startA, "Startzeile A"), (endA, "Endzeile A"), (startB, "Startzeile B"), (endB, "Endzeile B")]:
         if not str(v).strip().isdigit():
             raise ValueError(f"{name} muss eine Zahl sein.")
+
     rsA, reA = int(startA), int(endA)
     rsB, reB = int(startB), int(endB)
 
@@ -295,7 +319,6 @@ def run_compare(fileA_path, fileB_path,
 
     m = compare_blocks(A, B, key_col, compare_cols)
 
-    # output path: try working dir, else temp
     preferred_dir = os.getcwd()
     out_txt = safe_write_path(preferred_dir, "pruefprotokoll.txt")
 
@@ -315,15 +338,8 @@ def run_compare(fileA_path, fileB_path,
 
     return out_txt, os.path.basename(fileA_path), sheetA_name, os.path.basename(fileB_path), sheetB_name
 
-# ---------------- GUI ----------------
-def list_sheets(path: str) -> str:
-    xl = pd.ExcelFile(path)
-    names = xl.sheet_names
-    out = [f"{os.path.basename(path)} (Blätter: {len(names)})"]
-    for i, n in enumerate(names, start=1):
-        out.append(f"  {i}: {n}")
-    return "\n".join(out)
 
+# ---------------- GUI ----------------
 def main_gui():
     folder = os.getcwd()
     try:
@@ -341,42 +357,27 @@ def main_gui():
     fileA_path = tk.StringVar(value=f1)
     fileB_path = tk.StringVar(value=f2)
 
+    # Datei-Anzeige
     ttk.Label(frm, text="Datei A:").grid(column=0, row=0, sticky="w")
-    ttk.Label(frm, text=os.path.basename(f1)).grid(column=1, row=0, sticky="w")
-
-    ttk.Label(frm, text="Datei B:").grid(column=0, row=1, sticky="w")
-    ttk.Label(frm, text=os.path.basename(f2)).grid(column=1, row=1, sticky="w")
-
-    def swap_files():
-        a, b = fileA_path.get(), fileB_path.get()
-        fileA_path.set(b); fileB_path.set(a)
-        lblA.config(text=os.path.basename(fileA_path.get()))
-        lblB.config(text=os.path.basename(fileB_path.get()))
-
-    # rewrite with actual labels so swap works
-
-    ttk.Label(frm, text="Datei A:").grid(column=0, row=0, sticky="w")
-    ttk.Label(frm, text="Datei B:").grid(column=0, row=1, sticky="w")
-    
     lblA = ttk.Label(frm, text=os.path.basename(fileA_path.get()))
     lblA.grid(column=1, row=0, sticky="w")
 
+    ttk.Label(frm, text="Datei B:").grid(column=0, row=1, sticky="w")
     lblB = ttk.Label(frm, text=os.path.basename(fileB_path.get()))
     lblB.grid(column=1, row=1, sticky="w")
 
-def swap_files():
-    a, b = fileA_path.get(), fileB_path.get()
-    fileA_path.set(b)
-    fileB_path.set(a)
-    lblA.config(text=os.path.basename(fileA_path.get()))
-    lblB.config(text=os.path.basename(fileB_path.get()))
+    def swap_files():
+        a, b = fileA_path.get(), fileB_path.get()
+        fileA_path.set(b)
+        fileB_path.set(a)
+        lblA.config(text=os.path.basename(fileA_path.get()))
+        lblB.config(text=os.path.basename(fileB_path.get()))
 
-ttk.Button(frm, text="A ↔ B tauschen", command=swap_files).grid(
-    column=2, row=0, rowspan=2, padx=(10, 0)
-)
+    ttk.Button(frm, text="A ↔ B tauschen", command=swap_files).grid(
+        column=2, row=0, rowspan=2, padx=(10, 0)
+    )
 
-
-def show_sheets():
+    def show_sheets():
         try:
             a = list_sheets(fileA_path.get())
             b = list_sheets(fileB_path.get())
@@ -384,7 +385,9 @@ def show_sheets():
         except Exception as e:
             messagebox.showerror("Fehler", str(e))
 
-    ttk.Button(frm, text="Blätter anzeigen", command=show_sheets).grid(column=2, row=2, padx=(10,0), pady=(6,0))
+    ttk.Button(frm, text="Blätter anzeigen", command=show_sheets).grid(
+        column=2, row=2, padx=(10, 0), pady=(6, 0)
+    )
 
     ttk.Separator(frm, orient="horizontal").grid(column=0, row=3, columnspan=3, sticky="ew", pady=10)
 
@@ -425,8 +428,8 @@ def show_sheets():
     endB = tk.StringVar(value="88")
     ttk.Entry(frm, width=10, textvariable=endB).grid(column=1, row=13, sticky="w")
 
-    status = tk.StringVar(value="Start drücken → pruefprotokoll.txt (oder im TEMP-Ordner) wird erstellt.")
-    ttk.Label(frm, textvariable=status, foreground="gray").grid(column=0, row=16, columnspan=3, sticky="w", pady=(10,0))
+    status = tk.StringVar(value="Start drücken → pruefprotokoll.txt wird erstellt (oder im TEMP-Ordner).")
+    ttk.Label(frm, textvariable=status, foreground="gray").grid(column=0, row=16, columnspan=3, sticky="w", pady=(10, 0))
 
     def on_start():
         try:
@@ -451,9 +454,6 @@ def show_sheets():
 
     root.mainloop()
 
+
 if __name__ == "__main__":
     main_gui()
-
-
-
-

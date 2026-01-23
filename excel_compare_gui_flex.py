@@ -353,22 +353,28 @@ def main_gui():
         lblA.config(text=os.path.basename(fileA_path.get()))
         lblB.config(text=os.path.basename(fileB_path.get()))
 
-    lblA = ttk.Label(frm, text=os.path.basename(fileA_path.get()))
-    lblB = ttk.Label(frm, text=os.path.basename(fileB_path.get()))
-    lblA.grid_forget(); lblB.grid_forget()
-
     # rewrite with actual labels so swap works
-    for w in frm.grid_slaves():
-        if isinstance(w, ttk.Label) and w.cget("text") == os.path.basename(f1):
-            w.destroy()
-        if isinstance(w, ttk.Label) and w.cget("text") == os.path.basename(f2):
-            w.destroy()
+
+    ttk.Label(frm, text="Datei A:").grid(column=0, row=0, sticky="w")
+    ttk.Label(frm, text="Datei B:").grid(column=0, row=1, sticky="w")
+    
     lblA = ttk.Label(frm, text=os.path.basename(fileA_path.get()))
     lblA.grid(column=1, row=0, sticky="w")
+
     lblB = ttk.Label(frm, text=os.path.basename(fileB_path.get()))
     lblB.grid(column=1, row=1, sticky="w")
 
-    ttk.Button(frm, text="A ↔ B tauschen", command=swap_files).grid(column=2, row=0, rowspan=2, padx=(10,0))
+def swap_files():
+    a, b = fileA_path.get(), fileB_path.get()
+    fileA_path.set(b)
+    fileB_path.set(a)
+    lblA.config(text=os.path.basename(fileA_path.get()))
+    lblB.config(text=os.path.basename(fileB_path.get()))
+
+ttk.Button(frm, text="A ↔ B tauschen", command=swap_files).grid(
+    column=2, row=0, rowspan=2, padx=(10, 0)
+)
+
 
     def show_sheets():
         try:
@@ -447,5 +453,6 @@ def main_gui():
 
 if __name__ == "__main__":
     main_gui()
+
 
 

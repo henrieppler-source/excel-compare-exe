@@ -365,7 +365,7 @@ def main_gui():
             w.destroy()
     lblA = ttk.Label(frm, text=os.path.basename(fileA_path.get()))
     lblA.grid(column=1, row=0, sticky="w")
-    lblB = ttk.Label(frm, text=os.path.basename(fileB_path.get())))
+    lblB = ttk.Label(frm, text=os.path.basename(fileB_path.get()))
     lblB.grid(column=1, row=1, sticky="w")
 
     ttk.Button(frm, text="A ↔ B tauschen", command=swap_files).grid(column=2, row=0, rowspan=2, padx=(10,0))
@@ -447,4 +447,5 @@ def main_gui():
 
 if __name__ == "__main__":
     main_gui()
+
 

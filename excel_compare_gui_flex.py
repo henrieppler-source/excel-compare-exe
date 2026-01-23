@@ -67,7 +67,6 @@ def normalize_value(v):
     if isinstance(v, str):
         return " ".join(v.split())
     if isinstance(v, (int, float)):
-        # float-normalization helps avoid 12 vs 12.0 issues
         return float(v)
     if isinstance(v, (pd.Timestamp, datetime)):
         return pd.Timestamp(v).date().isoformat()
@@ -94,10 +93,6 @@ def excel_row_to_iloc(row_excel: int) -> int:
     return row_excel - 1
 
 
-def iloc_to_excel_row(iloc: int) -> int:
-    return iloc + 1
-
-
 # ---------------- Read block (header=None) ----------------
 def read_block(
     path: str,
@@ -107,6 +102,10 @@ def read_block(
     row_start_excel: int,
     row_end_excel: int,
 ) -> pd.DataFrame:
+    """
+    Reads the exact Excel area (row/col coordinates) without caring about headers.
+    Crucial: columns are taken from the ORIGINAL slice (no offset by helper columns).
+    """
     key_col = key_col.strip().upper()
     compare_cols = [c.strip().upper() for c in compare_cols]
 
@@ -141,10 +140,13 @@ def read_block(
             f"passt nicht zur Datei (zu wenig Zeilen)."
         )
 
-    block = df.iloc[start_i:end_i + 1].copy().reset_index(drop=False).rename(columns={"index": "_iloc"})
-    block["_excel_row"] = block["_iloc"].apply(iloc_to_excel_row)
+    # ✅ Slice from ORIGINAL df (no helper columns that would shift indices)
+    df_slice = df.iloc[start_i:end_i + 1, :].copy().reset_index(drop=True)
 
-    data = block.iloc[:, idxs].copy()
+    # Excel row numbers for the slice
+    excel_rows = pd.Series(range(rs, rs + len(df_slice)), name="_excel_row")
+
+    data = df_slice.iloc[:, idxs].copy()
     data.columns = needed
 
     # normalize
@@ -152,20 +154,19 @@ def read_block(
     for c in compare_cols:
         data[c] = data[c].apply(normalize_value)
 
-    out = pd.concat([block[["_excel_row"]].copy(), data], axis=1)
+    out = pd.concat([excel_rows, data], axis=1)
 
     # drop empty key
     out = out[out[key_col] != ""].copy()
 
-    # occurrence per key (order-sensitive!)
+    # occurrence per key (order-sensitive duplicates!)
     out["_occ"] = out.groupby(key_col).cumcount() + 1
     out["_key2"] = out[key_col].astype(str) + "#" + out["_occ"].astype(str)
 
-    # store values as VAL_0..VAL_n-1 for position-based comparison
+    # store values position-wise for matching A-col[i] to B-col[i]
     for i, c in enumerate(compare_cols):
         out[f"VAL_{i}"] = out[c]
 
-    # keep only what we need
     keep = ["_excel_row", key_col, "_occ", "_key2"] + [f"VAL_{i}" for i in range(len(compare_cols))]
     out = out[keep].copy()
 
@@ -177,12 +178,7 @@ def read_block(
 
 
 # ---------------- Compare blocks (order-sensitive duplicates) ----------------
-def compare_blocks(
-    A: pd.DataFrame,
-    B: pd.DataFrame,
-    nvals: int
-) -> pd.DataFrame:
-    # Merge on key+occurrence: "Zusammen#1", "Zusammen#2", ...
+def compare_blocks(A: pd.DataFrame, B: pd.DataFrame, nvals: int) -> pd.DataFrame:
     m = A.merge(B, on="_key2", how="outer", suffixes=("_A", "_B"), indicator=True)
 
     def status(row):
@@ -190,7 +186,6 @@ def compare_blocks(
             return "FEHLT_IN_B"
         if row["_merge"] == "right_only":
             return "FEHLT_IN_A"
-        # both: check all VAL_i
         for i in range(nvals):
             va = row.get(f"VAL_{i}_A", "")
             vb = row.get(f"VAL_{i}_B", "")
@@ -200,11 +195,16 @@ def compare_blocks(
 
     m["STATUS"] = m.apply(status, axis=1)
 
-    # per-position diffs
     for i in range(nvals):
         m[f"DIFF_{i}"] = (
-            (m["_merge"] == "both") &
-            (m.get(f"VAL_{i}_A").astype(str) != m.get(f"VAL_{i}_B").astype(str))
+            (m["_merge"] == "both")
+            and False
+        )
+    # vectorized diff flags
+    for i in range(nvals):
+        m[f"DIFF_{i}"] = (
+            (m["_merge"] == "both")
+            & (m.get(f"VAL_{i}_A").astype(str) != m.get(f"VAL_{i}_B").astype(str))
         )
 
     return m
@@ -265,13 +265,14 @@ def write_text_report(
     diffs = m[m["STATUS"] == "ABWEICHUNG"].copy()
     if not diffs.empty:
         lines.append("ABWEICHUNGEN (Datei Blatt Zelle: Wert / Datei Blatt Zelle: Wert):")
+        npos = min(len(colsA), len(colsB))
         for _, r in diffs.iterrows():
             key_val = r.get(f"{keyA}_A", r.get(f"{keyB}_B", ""))
             occ = str(r.get("_key2", "")).split("#")[-1]
             row_a = int(r.get("_excel_row_A")) if pd.notna(r.get("_excel_row_A")) else None
             row_b = int(r.get("_excel_row_B")) if pd.notna(r.get("_excel_row_B")) else None
 
-            for i in range(min(len(colsA), len(colsB))):
+            for i in range(npos):
                 if bool(r.get(f"DIFF_{i}", False)):
                     colA = colsA[i]
                     colB = colsB[i]
@@ -290,15 +291,6 @@ def write_text_report(
 
 
 # ---------------- File helpers ----------------
-def pick_two_xlsx(folder: str) -> tuple[str, str]:
-    files = sorted(glob.glob(os.path.join(folder, "*.xlsx")))
-    files = [f for f in files if not os.path.basename(f).lower().startswith("pruefprotokoll")]
-    if len(files) == 2:
-        return files[0], files[1]
-    # fallback: empty
-    return "", ""
-
-
 def list_sheets(path: str) -> str:
     xl = pd.ExcelFile(path)
     names = xl.sheet_names
@@ -325,8 +317,23 @@ def save_ini(cfg: configparser.ConfigParser, ini_path: str):
 
 
 def preset_sections(cfg: configparser.ConfigParser) -> list[str]:
-    # all non-default sections
     return [s for s in cfg.sections()]
+
+
+def resolve_file_value(v: str) -> str:
+    """
+    If INI contains only a filename, resolve it relative to current working directory (EXE folder).
+    If it looks like a path already, return as-is.
+    """
+    v = (v or "").strip()
+    if not v:
+        return v
+
+    # Heuristic: if it contains a path separator or drive hint, treat as path
+    if os.path.isabs(v) or (":" in v) or (os.sep in v) or ("/" in v) or ("\\" in v):
+        return v
+
+    return os.path.join(os.getcwd(), v)
 
 
 def apply_preset_to_vars(cfg: configparser.ConfigParser, section: str, vars_map: dict[str, tk.StringVar]):
@@ -335,14 +342,21 @@ def apply_preset_to_vars(cfg: configparser.ConfigParser, section: str, vars_map:
     sec = cfg[section]
     for k, var in vars_map.items():
         if k in sec:
-            var.set(sec.get(k, ""))
+            val = sec.get(k, "")
+            if k in ("fileA", "fileB"):
+                val = resolve_file_value(val)
+            var.set(val)
 
 
 def write_vars_to_preset(cfg: configparser.ConfigParser, section: str, vars_map: dict[str, tk.StringVar]):
     if section not in cfg:
         cfg.add_section(section)
+
     for k, var in vars_map.items():
-        cfg[section][k] = var.get().strip()
+        val = var.get().strip()
+        if k in ("fileA", "fileB") and val:
+            val = os.path.basename(val)  # ✅ only filenames in INI
+        cfg[section][k] = val
 
 
 # ---------------- Compare runner ----------------
@@ -350,7 +364,10 @@ def run_compare(
     fileA_path: str, fileB_path: str,
     sheetA_spec: str, keyA: str, colsA_spec: str, startA: str, endA: str,
     sheetB_spec: str, keyB: str, colsB_spec: str, startB: str, endB: str,
-):
+) -> str:
+    fileA_path = resolve_file_value(fileA_path)
+    fileB_path = resolve_file_value(fileB_path)
+
     if not fileA_path or not os.path.exists(fileA_path):
         raise ValueError("Datei A fehlt oder existiert nicht.")
     if not fileB_path or not os.path.exists(fileB_path):
@@ -401,17 +418,14 @@ def main_gui():
     cfg = load_ini(ini_path)
 
     root = tk.Tk()
-    root.title("Excel Blockvergleich (key-basiert, Duplikate order-sensitiv, Presets)")
+    root.title("Excel Blockvergleich (Duplikate order-sensitiv, Presets)")
 
     frm = ttk.Frame(root, padding=12)
     frm.grid(sticky="nsew")
 
-    # Default file pick: if exactly 2 xlsx in folder
-    f1, f2 = pick_two_xlsx(folder)
-
     # Variables
-    fileA_var = tk.StringVar(value=f1)
-    fileB_var = tk.StringVar(value=f2)
+    fileA_var = tk.StringVar(value="")
+    fileB_var = tk.StringVar(value="")
 
     preset_var = tk.StringVar(value="")
 
@@ -427,7 +441,6 @@ def main_gui():
     startB_var = tk.StringVar(value="16")
     endB_var = tk.StringVar(value="61")
 
-    # Map keys for INI
     vars_map = {
         "fileA": fileA_var,
         "fileB": fileB_var,
@@ -445,7 +458,7 @@ def main_gui():
 
     # --- Presets row ---
     ttk.Label(frm, text="Preset:").grid(column=0, row=0, sticky="w")
-    presets = [""] + preset_sections(cfg)  # empty = none
+    presets = [""] + preset_sections(cfg)
     preset_combo = ttk.Combobox(frm, textvariable=preset_var, values=presets, width=30, state="readonly")
     preset_combo.grid(column=1, row=0, sticky="w")
 
@@ -458,7 +471,7 @@ def main_gui():
             messagebox.showinfo("Preset", "Bitte ein Preset auswählen.")
             return
         apply_preset_to_vars(cfg, name, vars_map)
-        messagebox.showinfo("Preset", f"Preset '{name}' geladen.")
+        messagebox.showinfo("Preset", f"Preset '{name}' geladen.\n( Dateinamen werden relativ zum Programmordner aufgelöst )")
 
     def save_preset_as():
         name = simpledialog.askstring("Preset speichern", "Name für das Preset (z.B. Tabelle-1):", parent=root)
@@ -469,7 +482,7 @@ def main_gui():
         save_ini(cfg, ini_path)
         refresh_presets()
         preset_var.set(name)
-        messagebox.showinfo("Preset", f"Preset '{name}' gespeichert in {INI_NAME}.")
+        messagebox.showinfo("Preset", f"Preset '{name}' gespeichert in {INI_NAME}.\n(Dateien werden ohne Pfad gespeichert)")
 
     ttk.Button(frm, text="Preset laden", command=load_preset).grid(column=2, row=0, padx=(10, 0))
     ttk.Button(frm, text="Preset speichern…", command=save_preset_as).grid(column=3, row=0, padx=(6, 0))
@@ -506,9 +519,13 @@ def main_gui():
 
     def show_sheets():
         try:
-            a = list_sheets(fileA_var.get())
-            b = list_sheets(fileB_var.get())
-            messagebox.showinfo("Blätter anzeigen", a + "\n\n" + b)
+            a = resolve_file_value(fileA_var.get())
+            b = resolve_file_value(fileB_var.get())
+            if not a or not os.path.exists(a):
+                raise ValueError("Datei A fehlt/ungültig.")
+            if not b or not os.path.exists(b):
+                raise ValueError("Datei B fehlt/ungültig.")
+            messagebox.showinfo("Blätter anzeigen", list_sheets(a) + "\n\n" + list_sheets(b))
         except Exception as e:
             messagebox.showerror("Fehler", str(e))
 

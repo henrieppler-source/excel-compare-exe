@@ -363,7 +363,7 @@ def main_gui():
             w.destroy()
         if isinstance(w, ttk.Label) and w.cget("text") == os.path.basename(f2):
             w.destroy()
-    lblA = ttk.Label(frm, text=os.path.basename(fileA_path.get())))
+    lblA = ttk.Label(frm, text=os.path.basename(fileA_path.get()))
     lblA.grid(column=1, row=0, sticky="w")
     lblB = ttk.Label(frm, text=os.path.basename(fileB_path.get())))
     lblB.grid(column=1, row=1, sticky="w")
@@ -447,3 +447,4 @@ def main_gui():
 
 if __name__ == "__main__":
     main_gui()
+

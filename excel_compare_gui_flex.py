@@ -1,4 +1,5 @@
 import os
+import glob
 import tempfile
 from datetime import datetime
 import configparser
@@ -31,6 +32,13 @@ def index_to_col(idx: int) -> str:
 
 
 def parse_cols_spec(spec: str) -> list[str]:
+    """
+    Accepts:
+      - "D:K" or "D-K"
+      - "D,E,F" or "D;E;F"
+      - "AA:AD"
+    Returns list of column labels.
+    """
     s = spec.strip().upper().replace(" ", "")
     if not s:
         raise ValueError("Spaltenbereich ist leer.")
@@ -59,6 +67,7 @@ def normalize_value(v):
     if isinstance(v, str):
         return " ".join(v.split())
     if isinstance(v, (int, float)):
+        # float-normalization helps avoid 12 vs 12.0 issues
         return float(v)
     if isinstance(v, (pd.Timestamp, datetime)):
         return pd.Timestamp(v).date().isoformat()
@@ -83,6 +92,10 @@ def resolve_sheet_name(xl: pd.ExcelFile, sheet_spec: str | None) -> str:
 
 def excel_row_to_iloc(row_excel: int) -> int:
     return row_excel - 1
+
+
+def iloc_to_excel_row(iloc: int) -> int:
+    return iloc + 1
 
 
 # ---------------- Read block (header=None) ----------------
@@ -128,27 +141,31 @@ def read_block(
             f"passt nicht zur Datei (zu wenig Zeilen)."
         )
 
-    df_slice = df.iloc[start_i:end_i + 1, :].copy().reset_index(drop=True)
-    excel_rows = pd.Series(range(rs, rs + len(df_slice)), name="_excel_row")
+    block = df.iloc[start_i:end_i + 1].copy().reset_index(drop=False).rename(columns={"index": "_iloc"})
+    block["_excel_row"] = block["_iloc"].apply(iloc_to_excel_row)
 
-    data = df_slice.iloc[:, idxs].copy()
+    data = block.iloc[:, idxs].copy()
     data.columns = needed
 
+    # normalize
     data[key_col] = data[key_col].apply(normalize_value)
     for c in compare_cols:
         data[c] = data[c].apply(normalize_value)
 
-    out = pd.concat([excel_rows, data], axis=1)
+    out = pd.concat([block[["_excel_row"]].copy(), data], axis=1)
 
+    # drop empty key
     out = out[out[key_col] != ""].copy()
 
-    # Duplikate order-sensitiv
+    # occurrence per key (order-sensitive!)
     out["_occ"] = out.groupby(key_col).cumcount() + 1
     out["_key2"] = out[key_col].astype(str) + "#" + out["_occ"].astype(str)
 
+    # store values as VAL_0..VAL_n-1 for position-based comparison
     for i, c in enumerate(compare_cols):
         out[f"VAL_{i}"] = out[c]
 
+    # keep only what we need
     keep = ["_excel_row", key_col, "_occ", "_key2"] + [f"VAL_{i}" for i in range(len(compare_cols))]
     out = out[keep].copy()
 
@@ -160,7 +177,12 @@ def read_block(
 
 
 # ---------------- Compare blocks (order-sensitive duplicates) ----------------
-def compare_blocks(A: pd.DataFrame, B: pd.DataFrame, nvals: int) -> pd.DataFrame:
+def compare_blocks(
+    A: pd.DataFrame,
+    B: pd.DataFrame,
+    nvals: int
+) -> pd.DataFrame:
+    # Merge on key+occurrence: "Zusammen#1", "Zusammen#2", ...
     m = A.merge(B, on="_key2", how="outer", suffixes=("_A", "_B"), indicator=True)
 
     def status(row):
@@ -168,6 +190,7 @@ def compare_blocks(A: pd.DataFrame, B: pd.DataFrame, nvals: int) -> pd.DataFrame
             return "FEHLT_IN_B"
         if row["_merge"] == "right_only":
             return "FEHLT_IN_A"
+        # both: check all VAL_i
         for i in range(nvals):
             va = row.get(f"VAL_{i}_A", "")
             vb = row.get(f"VAL_{i}_B", "")
@@ -177,11 +200,11 @@ def compare_blocks(A: pd.DataFrame, B: pd.DataFrame, nvals: int) -> pd.DataFrame
 
     m["STATUS"] = m.apply(status, axis=1)
 
-    # ✅ nur vectorized (kein "and"!)
+    # per-position diffs
     for i in range(nvals):
         m[f"DIFF_{i}"] = (
-            (m["_merge"] == "both")
-            & (m.get(f"VAL_{i}_A").astype(str) != m.get(f"VAL_{i}_B").astype(str))
+            (m["_merge"] == "both") &
+            (m.get(f"VAL_{i}_A").astype(str) != m.get(f"VAL_{i}_B").astype(str))
         )
 
     return m
@@ -242,14 +265,13 @@ def write_text_report(
     diffs = m[m["STATUS"] == "ABWEICHUNG"].copy()
     if not diffs.empty:
         lines.append("ABWEICHUNGEN (Datei Blatt Zelle: Wert / Datei Blatt Zelle: Wert):")
-        npos = min(len(colsA), len(colsB))
         for _, r in diffs.iterrows():
             key_val = r.get(f"{keyA}_A", r.get(f"{keyB}_B", ""))
             occ = str(r.get("_key2", "")).split("#")[-1]
             row_a = int(r.get("_excel_row_A")) if pd.notna(r.get("_excel_row_A")) else None
             row_b = int(r.get("_excel_row_B")) if pd.notna(r.get("_excel_row_B")) else None
 
-            for i in range(npos):
+            for i in range(min(len(colsA), len(colsB))):
                 if bool(r.get(f"DIFF_{i}", False)):
                     colA = colsA[i]
                     colB = colsB[i]
@@ -267,7 +289,26 @@ def write_text_report(
         f.write("\n".join(lines))
 
 
-# ---------------- File / INI helpers ----------------
+# ---------------- File helpers ----------------
+def pick_two_xlsx(folder: str) -> tuple[str, str]:
+    files = sorted(glob.glob(os.path.join(folder, "*.xlsx")))
+    files = [f for f in files if not os.path.basename(f).lower().startswith("pruefprotokoll")]
+    if len(files) == 2:
+        return files[0], files[1]
+    # fallback: empty
+    return "", ""
+
+
+def list_sheets(path: str) -> str:
+    xl = pd.ExcelFile(path)
+    names = xl.sheet_names
+    out = [f"{os.path.basename(path)} (Blätter: {len(names)})"]
+    for i, n in enumerate(names, start=1):
+        out.append(f"  {i}: {n}")
+    return "\n".join(out)
+
+
+# ---------------- INI Presets ----------------
 INI_NAME = "excel_compare.ini"
 
 
@@ -284,27 +325,24 @@ def save_ini(cfg: configparser.ConfigParser, ini_path: str):
 
 
 def preset_sections(cfg: configparser.ConfigParser) -> list[str]:
+    # all non-default sections
     return [s for s in cfg.sections()]
 
 
-def resolve_file_value(v: str) -> str:
-    v = (v or "").strip()
-    if not v:
-        return v
-    # if it looks like a path, keep it
-    if os.path.isabs(v) or (":" in v) or (os.sep in v) or ("/" in v) or ("\\" in v):
-        return v
-    # otherwise resolve relative to EXE folder
-    return os.path.join(os.getcwd(), v)
+def apply_preset_to_vars(cfg: configparser.ConfigParser, section: str, vars_map: dict[str, tk.StringVar]):
+    if section not in cfg:
+        raise ValueError(f"Preset '{section}' nicht gefunden.")
+    sec = cfg[section]
+    for k, var in vars_map.items():
+        if k in sec:
+            var.set(sec.get(k, ""))
 
 
-def list_sheets(path: str) -> str:
-    xl = pd.ExcelFile(path)
-    names = xl.sheet_names
-    out = [f"{os.path.basename(path)} (Blätter: {len(names)})"]
-    for i, n in enumerate(names, start=1):
-        out.append(f"  {i}: {n}")
-    return "\n".join(out)
+def write_vars_to_preset(cfg: configparser.ConfigParser, section: str, vars_map: dict[str, tk.StringVar]):
+    if section not in cfg:
+        cfg.add_section(section)
+    for k, var in vars_map.items():
+        cfg[section][k] = var.get().strip()
 
 
 # ---------------- Compare runner ----------------
@@ -312,10 +350,7 @@ def run_compare(
     fileA_path: str, fileB_path: str,
     sheetA_spec: str, keyA: str, colsA_spec: str, startA: str, endA: str,
     sheetB_spec: str, keyB: str, colsB_spec: str, startB: str, endB: str,
-) -> str:
-    fileA_path = resolve_file_value(fileA_path)
-    fileB_path = resolve_file_value(fileB_path)
-
+):
     if not fileA_path or not os.path.exists(fileA_path):
         raise ValueError("Datei A fehlt oder existiert nicht.")
     if not fileB_path or not os.path.exists(fileB_path):
@@ -366,18 +401,17 @@ def main_gui():
     cfg = load_ini(ini_path)
 
     root = tk.Tk()
-    root.title("Excel Blockvergleich (Duplikate order-sensitiv, Presets)")
+    root.title("Excel Blockvergleich (key-basiert, Duplikate order-sensitiv, Presets)")
 
     frm = ttk.Frame(root, padding=12)
     frm.grid(sticky="nsew")
 
-    # Intern: voller Pfad
-    fileA_path_var = tk.StringVar(value="")
-    fileB_path_var = tk.StringVar(value="")
+    # Default file pick: if exactly 2 xlsx in folder
+    f1, f2 = pick_two_xlsx(folder)
 
-    # Anzeige: nur Dateiname
-    fileA_disp_var = tk.StringVar(value="")
-    fileB_disp_var = tk.StringVar(value="")
+    # Variables
+    fileA_var = tk.StringVar(value=f1)
+    fileB_var = tk.StringVar(value=f2)
 
     preset_var = tk.StringVar(value="")
 
@@ -393,62 +427,26 @@ def main_gui():
     startB_var = tk.StringVar(value="16")
     endB_var = tk.StringVar(value="61")
 
-    def set_fileA(path: str):
-        fileA_path_var.set(path)
-        fileA_disp_var.set(os.path.basename(path) if path else "")
-
-    def set_fileB(path: str):
-        fileB_path_var.set(path)
-        fileB_disp_var.set(os.path.basename(path) if path else "")
-
-    # --- Preset mapping (INI stores filenames only) ---
-    def preset_get_map():
-        return {
-            "fileA": fileA_disp_var.get().strip(),
-            "fileB": fileB_disp_var.get().strip(),
-            "sheetA": sheetA_var.get().strip(),
-            "keyA": keyA_var.get().strip(),
-            "colsA": colsA_var.get().strip(),
-            "startA": startA_var.get().strip(),
-            "endA": endA_var.get().strip(),
-            "sheetB": sheetB_var.get().strip(),
-            "keyB": keyB_var.get().strip(),
-            "colsB": colsB_var.get().strip(),
-            "startB": startB_var.get().strip(),
-            "endB": endB_var.get().strip(),
-        }
-
-    def preset_apply(sec: configparser.SectionProxy):
-        # files: resolve relative to cwd
-        fa = resolve_file_value(sec.get("fileA", ""))
-        fb = resolve_file_value(sec.get("fileB", ""))
-        if fa and os.path.exists(fa):
-            set_fileA(fa)
-        else:
-            fileA_disp_var.set(sec.get("fileA", ""))  # show name even if not found
-            fileA_path_var.set(fa)
-
-        if fb and os.path.exists(fb):
-            set_fileB(fb)
-        else:
-            fileB_disp_var.set(sec.get("fileB", ""))
-            fileB_path_var.set(fb)
-
-        sheetA_var.set(sec.get("sheetA", sheetA_var.get()))
-        keyA_var.set(sec.get("keyA", keyA_var.get()))
-        colsA_var.set(sec.get("colsA", colsA_var.get()))
-        startA_var.set(sec.get("startA", startA_var.get()))
-        endA_var.set(sec.get("endA", endA_var.get()))
-
-        sheetB_var.set(sec.get("sheetB", sheetB_var.get()))
-        keyB_var.set(sec.get("keyB", keyB_var.get()))
-        colsB_var.set(sec.get("colsB", colsB_var.get()))
-        startB_var.set(sec.get("startB", startB_var.get()))
-        endB_var.set(sec.get("endB", endB_var.get()))
+    # Map keys for INI
+    vars_map = {
+        "fileA": fileA_var,
+        "fileB": fileB_var,
+        "sheetA": sheetA_var,
+        "keyA": keyA_var,
+        "colsA": colsA_var,
+        "startA": startA_var,
+        "endA": endA_var,
+        "sheetB": sheetB_var,
+        "keyB": keyB_var,
+        "colsB": colsB_var,
+        "startB": startB_var,
+        "endB": endB_var,
+    }
 
     # --- Presets row ---
     ttk.Label(frm, text="Preset:").grid(column=0, row=0, sticky="w")
-    preset_combo = ttk.Combobox(frm, textvariable=preset_var, values=[""] + preset_sections(cfg), width=30, state="readonly")
+    presets = [""] + preset_sections(cfg)  # empty = none
+    preset_combo = ttk.Combobox(frm, textvariable=preset_var, values=presets, width=30, state="readonly")
     preset_combo.grid(column=1, row=0, sticky="w")
 
     def refresh_presets():
@@ -459,10 +457,7 @@ def main_gui():
         if not name:
             messagebox.showinfo("Preset", "Bitte ein Preset auswählen.")
             return
-        if name not in cfg:
-            messagebox.showerror("Preset", f"Preset '{name}' nicht gefunden.")
-            return
-        preset_apply(cfg[name])
+        apply_preset_to_vars(cfg, name, vars_map)
         messagebox.showinfo("Preset", f"Preset '{name}' geladen.")
 
     def save_preset_as():
@@ -470,16 +465,7 @@ def main_gui():
         if not name:
             return
         name = name.strip()
-        if name not in cfg:
-            cfg.add_section(name)
-        values = preset_get_map()
-
-        # store ONLY filenames in ini
-        cfg[name]["fileA"] = os.path.basename(values["fileA"]) if values["fileA"] else ""
-        cfg[name]["fileB"] = os.path.basename(values["fileB"]) if values["fileB"] else ""
-        for k in ["sheetA", "keyA", "colsA", "startA", "endA", "sheetB", "keyB", "colsB", "startB", "endB"]:
-            cfg[name][k] = values[k]
-
+        write_vars_to_preset(cfg, name, vars_map)
         save_ini(cfg, ini_path)
         refresh_presets()
         preset_var.set(name)
@@ -490,43 +476,39 @@ def main_gui():
 
     ttk.Separator(frm, orient="horizontal").grid(column=0, row=1, columnspan=4, sticky="ew", pady=8)
 
-    # --- Files row (display-only) ---
+    # --- Files row ---
     ttk.Label(frm, text="Datei A:").grid(column=0, row=2, sticky="w")
-    ttk.Entry(frm, textvariable=fileA_disp_var, width=55, state="readonly").grid(column=1, row=2, columnspan=2, sticky="w")
+    ttk.Entry(frm, textvariable=fileA_var, width=55).grid(column=1, row=2, columnspan=2, sticky="w")
 
     def browse_a():
         p = filedialog.askopenfilename(title="Datei A wählen", filetypes=[("Excel", "*.xlsx")])
         if p:
-            set_fileA(p)
+            fileA_var.set(p)
 
     ttk.Button(frm, text="…", width=3, command=browse_a).grid(column=3, row=2, sticky="w")
 
     ttk.Label(frm, text="Datei B:").grid(column=0, row=3, sticky="w")
-    ttk.Entry(frm, textvariable=fileB_disp_var, width=55, state="readonly").grid(column=1, row=3, columnspan=2, sticky="w")
+    ttk.Entry(frm, textvariable=fileB_var, width=55).grid(column=1, row=3, columnspan=2, sticky="w")
 
     def browse_b():
         p = filedialog.askopenfilename(title="Datei B wählen", filetypes=[("Excel", "*.xlsx")])
         if p:
-            set_fileB(p)
+            fileB_var.set(p)
 
     ttk.Button(frm, text="…", width=3, command=browse_b).grid(column=3, row=3, sticky="w")
 
     def swap_files():
-        a_path, b_path = fileA_path_var.get(), fileB_path_var.get()
-        set_fileA(b_path)
-        set_fileB(a_path)
+        a, b = fileA_var.get(), fileB_var.get()
+        fileA_var.set(b)
+        fileB_var.set(a)
 
     ttk.Button(frm, text="A ↔ B tauschen", command=swap_files).grid(column=2, row=4, sticky="w", pady=(6, 0))
 
     def show_sheets():
         try:
-            a = resolve_file_value(fileA_path_var.get() or fileA_disp_var.get())
-            b = resolve_file_value(fileB_path_var.get() or fileB_disp_var.get())
-            if not a or not os.path.exists(a):
-                raise ValueError("Datei A fehlt/ungültig.")
-            if not b or not os.path.exists(b):
-                raise ValueError("Datei B fehlt/ungültig.")
-            messagebox.showinfo("Blätter anzeigen", list_sheets(a) + "\n\n" + list_sheets(b))
+            a = list_sheets(fileA_var.get())
+            b = list_sheets(fileB_var.get())
+            messagebox.showinfo("Blätter anzeigen", a + "\n\n" + b)
         except Exception as e:
             messagebox.showerror("Fehler", str(e))
 
@@ -538,6 +520,7 @@ def main_gui():
     ttk.Label(frm, text="Einstellungen Datei A", font=("Segoe UI", 9, "bold")).grid(column=0, row=6, sticky="w")
     ttk.Label(frm, text="Einstellungen Datei B", font=("Segoe UI", 9, "bold")).grid(column=2, row=6, sticky="w")
 
+    # A fields
     ttk.Label(frm, text="Blatt (Nr/Name):").grid(column=0, row=7, sticky="w")
     ttk.Entry(frm, textvariable=sheetA_var, width=10).grid(column=1, row=7, sticky="w")
 
@@ -553,6 +536,7 @@ def main_gui():
     ttk.Label(frm, text="Endzeile:").grid(column=0, row=11, sticky="w")
     ttk.Entry(frm, textvariable=endA_var, width=10).grid(column=1, row=11, sticky="w")
 
+    # B fields
     ttk.Label(frm, text="Blatt (Nr/Name):").grid(column=2, row=7, sticky="w")
     ttk.Entry(frm, textvariable=sheetB_var, width=10).grid(column=3, row=7, sticky="w")
 
@@ -575,11 +559,8 @@ def main_gui():
 
     def on_start():
         try:
-            a_path = fileA_path_var.get() or resolve_file_value(fileA_disp_var.get())
-            b_path = fileB_path_var.get() or resolve_file_value(fileB_disp_var.get())
-
             out_txt = run_compare(
-                a_path, b_path,
+                fileA_var.get(), fileB_var.get(),
                 sheetA_var.get(), keyA_var.get(), colsA_var.get(), startA_var.get(), endA_var.get(),
                 sheetB_var.get(), keyB_var.get(), colsB_var.get(), startB_var.get(), endB_var.get(),
             )

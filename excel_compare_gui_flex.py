@@ -1,5 +1,7 @@
 import os
+import sys
 import glob
+import re
 import tempfile
 from datetime import datetime
 import configparser
@@ -7,6 +9,9 @@ import configparser
 import pandas as pd
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
+
+__version__ = "2.0.0"
+__build_date__ = "2026-02-04"
 
 
 # ---------------- Excel column helpers ----------------
@@ -211,14 +216,64 @@ def compare_blocks(
 
 
 # ---------------- Reporting ----------------
-def safe_write_path(preferred_dir: str, filename: str) -> str:
-    out_path = os.path.join(preferred_dir, filename)
+def get_app_dir() -> str:
+    """Directory where the running app/exe resides (not the working directory)."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def get_default_output_dir() -> str:
+    """Prefer app dir if writable; otherwise fall back to Documents\ExcelBlockvergleich."""
+    app_dir = get_app_dir()
+
+    # Try app dir
     try:
-        with open(out_path, "w", encoding="utf-8") as f:
-            f.write("")
-        return out_path
+        test = os.path.join(app_dir, "_write_test.tmp")
+        with open(test, "w", encoding="utf-8") as f:
+            f.write("x")
+        os.remove(test)
+        return app_dir
     except Exception:
-        return os.path.join(tempfile.gettempdir(), filename)
+        pass
+
+    docs = os.path.join(os.path.expanduser("~"), "Documents", "ExcelBlockvergleich")
+    os.makedirs(docs, exist_ok=True)
+    return docs
+
+
+def safe_write_path(filename: str) -> str:
+    out_dir = get_default_output_dir()
+    return os.path.join(out_dir, filename)
+
+
+def sanitize_filename_component(s: str, max_len: int = 60) -> str:
+    """
+    Make a string safe for use in filenames on Windows.
+    Replaces forbidden characters and trims length.
+    """
+    if s is None:
+        return ""
+    s = str(s).strip()
+    # Replace path/illegal characters: \ / : * ? " < > | plus control chars
+    s = re.sub(r'[\\/:*?"<>|\x00-\x1f]', '-', s)
+    # Collapse whitespace
+    s = re.sub(r'\s+', ' ', s).strip()
+    # Replace spaces with hyphen for readability
+    s = s.replace(' ', '-')
+    # Avoid trailing dots/spaces (Windows quirk)
+    s = s.rstrip(' .')
+    if len(s) > max_len:
+        s = s[:max_len].rstrip(' .-')
+    return s
+
+
+def make_report_filename(prefix: str = "Pruefprotokoll", sheet_tag: str | None = None, ext: str = "txt") -> str:
+    ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    tag = sanitize_filename_component(sheet_tag) if sheet_tag else ""
+    if tag:
+        return f"{prefix}_{tag}_{ts}.{ext}"
+    return f"{prefix}_{ts}.{ext}"
 
 
 def write_text_report(
@@ -231,6 +286,8 @@ def write_text_report(
 
     lines = []
     lines.append("PRÜFPROTOKOLL")
+    lines.append(f"Version: {__version__} | Build: {__build_date__} | Lauf: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(f"Protokollpfad: {out_txt_path}")
     lines.append(f"A: {fileA} | Blatt: {sheetA} | Key: {keyA} | Spalten: {','.join(colsA)} | Zeilen: {rsA}-{reA}")
     lines.append(f"B: {fileB} | Blatt: {sheetB} | Key: {keyB} | Spalten: {','.join(colsB)} | Zeilen: {rsB}-{reB}")
     lines.append("")
@@ -379,10 +436,10 @@ def run_compare(
     nvals = len(colsA)
     m = compare_blocks(A, B, nvals=nvals)
 
-    out_txt = safe_write_path(os.getcwd(), "pruefprotokoll.txt")
-
     sheetA_name = A.attrs.get("sheet_name", sheetA_spec)
     sheetB_name = B.attrs.get("sheet_name", sheetB_spec)
+
+    out_txt = safe_write_path(make_report_filename(sheet_tag=sheetB_name))
 
     write_text_report(
         m=m,
@@ -554,8 +611,20 @@ def main_gui():
 
     ttk.Separator(frm, orient="horizontal").grid(column=0, row=12, columnspan=4, sticky="ew", pady=10)
 
-    status = tk.StringVar(value=f"Ausgabe: pruefprotokoll.txt (oder TEMP). Presets: {INI_NAME}")
+    status = tk.StringVar(value=f"Ausgabeordner: {get_default_output_dir()} (Protokollname mit Zeitstempel). Presets: {INI_NAME}")
     ttk.Label(frm, textvariable=status, foreground="gray").grid(column=0, row=13, columnspan=4, sticky="w")
+
+def show_about():
+    exe_path = sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__)
+    out_dir = get_default_output_dir()
+    info = (
+        f"Excel Blockvergleich\n"
+        f"Version: {__version__} (Build: {__build_date__})\n\n"
+        f"Programm: {exe_path}\n"
+        f"INI: {ini_path}\n"
+        f"Ausgabeordner: {out_dir}\n"
+    )
+    messagebox.showinfo("Über", info)
 
     def on_start():
         try:
@@ -572,6 +641,7 @@ def main_gui():
 
     ttk.Button(frm, text="Start Vergleich", command=on_start).grid(column=0, row=14, sticky="w")
     ttk.Button(frm, text="Beenden", command=root.destroy).grid(column=1, row=14, sticky="w")
+    ttk.Button(frm, text="Über…", command=show_about).grid(column=2, row=14, sticky="w")
 
     root.mainloop()
 

@@ -1,7 +1,6 @@
 import os
 import sys
 import glob
-import tempfile
 from datetime import datetime
 import configparser
 
@@ -11,6 +10,22 @@ from tkinter import ttk, messagebox, filedialog, simpledialog
 
 __version__ = "2.0.0"
 __build_date__ = "2026-02-04"
+
+
+def get_base_dir() -> str:
+    # In EXE: Ordner der EXE. Im Script: Ordner der .py
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def bootlog(msg: str):
+    try:
+        p = os.path.join(get_base_dir(), "startup.log")
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now().isoformat()} {msg}\n")
+    except Exception:
+        pass
 
 
 # ---------------- Excel column helpers ----------------
@@ -36,13 +51,6 @@ def index_to_col(idx: int) -> str:
 
 
 def parse_cols_spec(spec: str) -> list[str]:
-    """
-    Accepts:
-      - "D:K" or "D-K"
-      - "D,E,F" or "D;E;F"
-      - "AA:AD"
-    Returns list of column labels.
-    """
     s = spec.strip().upper().replace(" ", "")
     if not s:
         raise ValueError("Spaltenbereich ist leer.")
@@ -71,7 +79,6 @@ def normalize_value(v):
     if isinstance(v, str):
         return " ".join(v.split())
     if isinstance(v, (int, float)):
-        # float-normalization helps avoid 12 vs 12.0 issues
         return float(v)
     if isinstance(v, (pd.Timestamp, datetime)):
         return pd.Timestamp(v).date().isoformat()
@@ -151,25 +158,20 @@ def read_block(
     data = block.iloc[:, idxs].copy()
     data.columns = needed
 
-    # normalize
     data[key_col] = data[key_col].apply(normalize_value)
     for c in compare_cols:
         data[c] = data[c].apply(normalize_value)
 
     out = pd.concat([block[["_excel_row"]].copy(), data], axis=1)
 
-    # drop empty key
     out = out[out[key_col] != ""].copy()
 
-    # occurrence per key (order-sensitive!)
     out["_occ"] = out.groupby(key_col).cumcount() + 1
     out["_key2"] = out[key_col].astype(str) + "#" + out["_occ"].astype(str)
 
-    # store values as VAL_0..VAL_n-1 for position-based comparison
     for i, c in enumerate(compare_cols):
         out[f"VAL_{i}"] = out[c]
 
-    # keep only what we need
     keep = ["_excel_row", key_col, "_occ", "_key2"] + [f"VAL_{i}" for i in range(len(compare_cols))]
     out = out[keep].copy()
 
@@ -181,12 +183,7 @@ def read_block(
 
 
 # ---------------- Compare blocks (order-sensitive duplicates) ----------------
-def compare_blocks(
-    A: pd.DataFrame,
-    B: pd.DataFrame,
-    nvals: int
-) -> pd.DataFrame:
-    # Merge on key+occurrence: "Zusammen#1", "Zusammen#2", ...
+def compare_blocks(A: pd.DataFrame, B: pd.DataFrame, nvals: int) -> pd.DataFrame:
     m = A.merge(B, on="_key2", how="outer", suffixes=("_A", "_B"), indicator=True)
 
     def status(row):
@@ -194,7 +191,6 @@ def compare_blocks(
             return "FEHLT_IN_B"
         if row["_merge"] == "right_only":
             return "FEHLT_IN_A"
-        # both: check all VAL_i
         for i in range(nvals):
             va = row.get(f"VAL_{i}_A", "")
             vb = row.get(f"VAL_{i}_B", "")
@@ -204,7 +200,6 @@ def compare_blocks(
 
     m["STATUS"] = m.apply(status, axis=1)
 
-    # per-position diffs
     for i in range(nvals):
         m[f"DIFF_{i}"] = (
             (m["_merge"] == "both") &
@@ -215,18 +210,9 @@ def compare_blocks(
 
 
 # ---------------- Reporting ----------------
-def get_app_dir() -> str:
-    """Directory where the running app/exe resides (not the working directory)."""
-    if getattr(sys, "frozen", False):
-        return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
-
-
 def get_default_output_dir() -> str:
-    """Prefer app dir if writable; otherwise fall back to Documents\ExcelBlockvergleich."""
-    app_dir = get_app_dir()
+    app_dir = get_base_dir()
 
-    # Try app dir
     try:
         test = os.path.join(app_dir, "_write_test.tmp")
         with open(test, "w", encoding="utf-8") as f:
@@ -246,9 +232,25 @@ def safe_write_path(filename: str) -> str:
     return os.path.join(out_dir, filename)
 
 
-def make_report_filename(prefix: str = "pruefprotokoll", ext: str = "txt") -> str:
+def sanitize_filename(s: str, max_len: int = 80) -> str:
+    s = (s or "").strip()
+    bad = '\\/:*?"<>|'
+    for ch in bad:
+        s = s.replace(ch, "-")
+    s = s.replace(" ", "-")
+    # ein bisschen aufräumen
+    while "--" in s:
+        s = s.replace("--", "-")
+    s = s.strip("-")
+    if not s:
+        s = "Sheet"
+    return s[:max_len]
+
+
+def make_report_filename(sheet_b_name: str, prefix: str = "Pruefprotokoll", ext: str = "txt") -> str:
     ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    return f"{prefix}_{ts}.{ext}"
+    tag = sanitize_filename(sheet_b_name)
+    return f"{prefix}_{tag}_{ts}.{ext}"
 
 
 def write_text_report(
@@ -327,7 +329,6 @@ def pick_two_xlsx(folder: str) -> tuple[str, str]:
     files = [f for f in files if not os.path.basename(f).lower().startswith("pruefprotokoll")]
     if len(files) == 2:
         return files[0], files[1]
-    # fallback: empty
     return "", ""
 
 
@@ -357,7 +358,6 @@ def save_ini(cfg: configparser.ConfigParser, ini_path: str):
 
 
 def preset_sections(cfg: configparser.ConfigParser) -> list[str]:
-    # all non-default sections
     return [s for s in cfg.sections()]
 
 
@@ -383,6 +383,8 @@ def run_compare(
     sheetA_spec: str, keyA: str, colsA_spec: str, startA: str, endA: str,
     sheetB_spec: str, keyB: str, colsB_spec: str, startB: str, endB: str,
 ):
+    bootlog("START run_compare")
+
     if not fileA_path or not os.path.exists(fileA_path):
         raise ValueError("Datei A fehlt oder existiert nicht.")
     if not fileB_path or not os.path.exists(fileB_path):
@@ -408,13 +410,12 @@ def run_compare(
     A = read_block(fileA_path, sheetA_spec, keyA, colsA, rsA, reA)
     B = read_block(fileB_path, sheetB_spec, keyB, colsB, rsB, reB)
 
-    nvals = len(colsA)
-    m = compare_blocks(A, B, nvals=nvals)
-
-    out_txt = safe_write_path(make_report_filename())
+    m = compare_blocks(A, B, nvals=len(colsA))
 
     sheetA_name = A.attrs.get("sheet_name", sheetA_spec)
     sheetB_name = B.attrs.get("sheet_name", sheetB_spec)
+
+    out_txt = safe_write_path(make_report_filename(sheet_b_name=sheetB_name))
 
     write_text_report(
         m=m,
@@ -428,20 +429,21 @@ def run_compare(
 
 # ---------------- GUI ----------------
 def main_gui():
-    folder = os.getcwd()
+    bootlog("START main_gui")
+
+    folder = get_base_dir()
     ini_path = os.path.join(folder, INI_NAME)
     cfg = load_ini(ini_path)
 
+    bootlog("BEFORE tk.Tk")
     root = tk.Tk()
-    root.title("Excel Blockvergleich (key-basiert, Duplikate order-sensitiv, Presets)")
+    root.title(f"Excel Blockvergleich (v{__version__})")
 
     frm = ttk.Frame(root, padding=12)
     frm.grid(sticky="nsew")
 
-    # Default file pick: if exactly 2 xlsx in folder
     f1, f2 = pick_two_xlsx(folder)
 
-    # Variables
     fileA_var = tk.StringVar(value=f1)
     fileB_var = tk.StringVar(value=f2)
 
@@ -459,7 +461,6 @@ def main_gui():
     startB_var = tk.StringVar(value="16")
     endB_var = tk.StringVar(value="61")
 
-    # Map keys for INI
     vars_map = {
         "fileA": fileA_var,
         "fileB": fileB_var,
@@ -477,7 +478,7 @@ def main_gui():
 
     # --- Presets row ---
     ttk.Label(frm, text="Preset:").grid(column=0, row=0, sticky="w")
-    presets = [""] + preset_sections(cfg)  # empty = none
+    presets = [""] + preset_sections(cfg)
     preset_combo = ttk.Combobox(frm, textvariable=preset_var, values=presets, width=30, state="readonly")
     preset_combo.grid(column=1, row=0, sticky="w")
 
@@ -548,11 +549,9 @@ def main_gui():
 
     ttk.Separator(frm, orient="horizontal").grid(column=0, row=5, columnspan=4, sticky="ew", pady=10)
 
-    # --- Settings columns ---
     ttk.Label(frm, text="Einstellungen Datei A", font=("Segoe UI", 9, "bold")).grid(column=0, row=6, sticky="w")
     ttk.Label(frm, text="Einstellungen Datei B", font=("Segoe UI", 9, "bold")).grid(column=2, row=6, sticky="w")
 
-    # A fields
     ttk.Label(frm, text="Blatt (Nr/Name):").grid(column=0, row=7, sticky="w")
     ttk.Entry(frm, textvariable=sheetA_var, width=10).grid(column=1, row=7, sticky="w")
 
@@ -568,7 +567,6 @@ def main_gui():
     ttk.Label(frm, text="Endzeile:").grid(column=0, row=11, sticky="w")
     ttk.Entry(frm, textvariable=endA_var, width=10).grid(column=1, row=11, sticky="w")
 
-    # B fields
     ttk.Label(frm, text="Blatt (Nr/Name):").grid(column=2, row=7, sticky="w")
     ttk.Entry(frm, textvariable=sheetB_var, width=10).grid(column=3, row=7, sticky="w")
 
@@ -586,20 +584,20 @@ def main_gui():
 
     ttk.Separator(frm, orient="horizontal").grid(column=0, row=12, columnspan=4, sticky="ew", pady=10)
 
-    status = tk.StringVar(value=f"Ausgabeordner: {get_default_output_dir()} (Protokollname mit Zeitstempel). Presets: {INI_NAME}")
+    status = tk.StringVar(value=f"Ausgabeordner: {get_default_output_dir()} | Presets: {INI_NAME}")
     ttk.Label(frm, textvariable=status, foreground="gray").grid(column=0, row=13, columnspan=4, sticky="w")
 
-def show_about():
-    exe_path = sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__)
-    out_dir = get_default_output_dir()
-    info = (
-        f"Excel Blockvergleich\n"
-        f"Version: {__version__} (Build: {__build_date__})\n\n"
-        f"Programm: {exe_path}\n"
-        f"INI: {ini_path}\n"
-        f"Ausgabeordner: {out_dir}\n"
-    )
-    messagebox.showinfo("Über", info)
+    def show_about():
+        exe_path = sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__)
+        out_dir = get_default_output_dir()
+        info = (
+            f"Excel Blockvergleich\n"
+            f"Version: {__version__} (Build: {__build_date__})\n\n"
+            f"Programm: {exe_path}\n"
+            f"INI: {ini_path}\n"
+            f"Ausgabeordner: {out_dir}\n"
+        )
+        messagebox.showinfo("Über", info)
 
     def on_start():
         try:

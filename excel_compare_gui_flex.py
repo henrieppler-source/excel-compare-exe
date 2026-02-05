@@ -1,7 +1,6 @@
 import os
 import sys
 import glob
-import re
 import tempfile
 from datetime import datetime
 import configparser
@@ -247,32 +246,8 @@ def safe_write_path(filename: str) -> str:
     return os.path.join(out_dir, filename)
 
 
-def sanitize_filename_component(s: str, max_len: int = 60) -> str:
-    """
-    Make a string safe for use in filenames on Windows.
-    Replaces forbidden characters and trims length.
-    """
-    if s is None:
-        return ""
-    s = str(s).strip()
-    # Replace path/illegal characters: \ / : * ? " < > | plus control chars
-    s = re.sub(r'[\\/:*?"<>|\x00-\x1f]', '-', s)
-    # Collapse whitespace
-    s = re.sub(r'\s+', ' ', s).strip()
-    # Replace spaces with hyphen for readability
-    s = s.replace(' ', '-')
-    # Avoid trailing dots/spaces (Windows quirk)
-    s = s.rstrip(' .')
-    if len(s) > max_len:
-        s = s[:max_len].rstrip(' .-')
-    return s
-
-
-def make_report_filename(prefix: str = "Pruefprotokoll", sheet_tag: str | None = None, ext: str = "txt") -> str:
+def make_report_filename(prefix: str = "pruefprotokoll", ext: str = "txt") -> str:
     ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    tag = sanitize_filename_component(sheet_tag) if sheet_tag else ""
-    if tag:
-        return f"{prefix}_{tag}_{ts}.{ext}"
     return f"{prefix}_{ts}.{ext}"
 
 
@@ -436,10 +411,10 @@ def run_compare(
     nvals = len(colsA)
     m = compare_blocks(A, B, nvals=nvals)
 
+    out_txt = safe_write_path(make_report_filename())
+
     sheetA_name = A.attrs.get("sheet_name", sheetA_spec)
     sheetB_name = B.attrs.get("sheet_name", sheetB_spec)
-
-    out_txt = safe_write_path(make_report_filename(sheet_tag=sheetB_name))
 
     write_text_report(
         m=m,

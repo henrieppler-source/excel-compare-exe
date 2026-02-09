@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import tempfile
 from datetime import datetime
@@ -6,6 +8,10 @@ import configparser
 import pandas as pd
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
+
+
+APP_VERSION = "5.0.2"
+INI_NAME = "excel_compare.ini"
 
 
 # ---------------- Excel column helpers ----------------
@@ -31,10 +37,9 @@ def index_to_col(idx: int) -> str:
 
 
 def parse_cols_spec(spec: str) -> list[str]:
-    s = spec.strip().upper().replace(" ", "")
+    s = (spec or "").strip().upper().replace(" ", "")
     if not s:
         raise ValueError("Spaltenbereich ist leer.")
-
     s = s.replace("-", ":")
     if ":" in s:
         start, end = s.split(":", 1)
@@ -44,7 +49,6 @@ def parse_cols_spec(spec: str) -> list[str]:
         if b < a:
             a, b = b, a
         return [index_to_col(i) for i in range(a, b + 1)]
-
     parts = [p for p in s.replace(";", ",").split(",") if p]
     if not parts:
         raise ValueError("Ungültige Spaltenliste. Beispiel: D,E,F oder D:K")
@@ -59,10 +63,10 @@ def normalize_value(v):
     if isinstance(v, str):
         return " ".join(v.split())
     if isinstance(v, (int, float)):
-        return float(v)
+        return float(v) if not (isinstance(v, float) and v.is_integer()) else int(v)
     if isinstance(v, (pd.Timestamp, datetime)):
         return pd.Timestamp(v).date().isoformat()
-    return str(v)
+    return str(v).strip()
 
 
 # ---------------- Sheet resolution ----------------
@@ -141,7 +145,7 @@ def read_block(
     out = pd.concat([excel_rows, data], axis=1)
     out = out[out[key_col] != ""].copy()
 
-    # Duplikate order-sensitiv
+    # Duplikate order-sensitiv: occurrence zählt Reihenfolge im Block
     out["_occ"] = out.groupby(key_col).cumcount() + 1
     out["_key2"] = out[key_col].astype(str) + "#" + out["_occ"].astype(str)
 
@@ -265,10 +269,7 @@ def write_text_report(
         f.write("\n".join(lines))
 
 
-# ---------------- INI / file helpers ----------------
-INI_NAME = "excel_compare.ini"
-
-
+# ---------------- INI helpers ----------------
 def load_ini(ini_path: str) -> configparser.ConfigParser:
     cfg = configparser.ConfigParser()
     if os.path.exists(ini_path):
@@ -281,15 +282,12 @@ def save_ini(cfg: configparser.ConfigParser, ini_path: str):
         cfg.write(f)
 
 
-def preset_sections(cfg: configparser.ConfigParser) -> list[str]:
-    return [s for s in cfg.sections()]
-
-
 def resolve_file_value(v: str) -> str:
     v = (v or "").strip()
     if not v:
         return v
-    if os.path.isabs(v) or (":" in v) or (os.sep in v) or ("/" in v) or ("\\" in v):
+    # already looks like path?
+    if os.path.isabs(v) or (":" in v) or ("/" in v) or ("\\" in v):
         return v
     return os.path.join(os.getcwd(), v)
 
@@ -361,7 +359,7 @@ def main_gui():
     cfg = load_ini(ini_path)
 
     root = tk.Tk()
-    root.title("Excel Blockvergleich (Presets)")
+    root.title(f"Excel Blockvergleich (Presets) v{APP_VERSION}")
 
     frm = ttk.Frame(root, padding=12)
     frm.grid(sticky="nsew")
@@ -397,13 +395,14 @@ def main_gui():
         fileB_disp_var.set(os.path.basename(path) if path else "")
 
     def refresh_presets(combo):
-        combo["values"] = [""] + preset_sections(cfg)
+        combo["values"] = [""] + list(cfg.sections())
 
     def preset_apply(section: str):
         if section not in cfg:
             raise ValueError(f"Preset '{section}' nicht gefunden.")
         sec = cfg[section]
 
+        # in INI nur Dateiname -> relativ zum EXE-Ordner
         fa = resolve_file_value(sec.get("fileA", ""))
         fb = resolve_file_value(sec.get("fileB", ""))
 
@@ -428,7 +427,7 @@ def main_gui():
 
     # --- Presets row ---
     ttk.Label(frm, text="Preset:").grid(column=0, row=0, sticky="w")
-    preset_combo = ttk.Combobox(frm, textvariable=preset_var, values=[""] + preset_sections(cfg), width=30, state="readonly")
+    preset_combo = ttk.Combobox(frm, textvariable=preset_var, values=[""] + list(cfg.sections()), width=30, state="readonly")
     preset_combo.grid(column=1, row=0, sticky="w")
 
     def load_preset():
@@ -450,7 +449,6 @@ def main_gui():
         if name not in cfg:
             cfg.add_section(name)
 
-        # INI speichert nur Dateinamen (ohne Pfad)
         cfg[name]["fileA"] = os.path.basename(fileA_disp_var.get().strip()) if fileA_disp_var.get().strip() else ""
         cfg[name]["fileB"] = os.path.basename(fileB_disp_var.get().strip()) if fileB_disp_var.get().strip() else ""
 

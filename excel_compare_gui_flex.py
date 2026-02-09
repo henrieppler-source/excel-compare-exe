@@ -1,656 +1,613 @@
-import os
-import sys
-import glob
-from datetime import datetime
+# automation_engine.py
+from __future__ import annotations
+
 import configparser
+import fnmatch
+import glob
+import os
+import re
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
 
-import pandas as pd
-import tkinter as tk
-from tkinter import ttk, messagebox, filedialog, simpledialog
+# ------------------------------------------------------------
+# WICHTIG:
+# Prüfkern NICHT verändern. Nur importieren und aufrufen.
+# Passe den Import an dein Projekt an.
+# ------------------------------------------------------------
+# Beispiel:
+# from core_compare import run_compare
+# ODER:
+# from excel_blockvergleich import run_compare
 
-__version__ = "2.0.2"
-__build_date__ = "2026-02-09"
-
-
-# ================== PATH / LOG ==================
-def get_base_dir() -> str:
-    # In EXE: Ordner der EXE. Im Script: Ordner der .py
-    if getattr(sys, "frozen", False):
-        return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
-
-
-def bootlog(msg: str):
-    try:
-        p = os.path.join(get_base_dir(), "startup.log")
-        with open(p, "a", encoding="utf-8") as f:
-            f.write(f"{datetime.now().isoformat()} {msg}\n")
-    except Exception:
-        pass
-
-
-# ================== EXCEL COLUMN HELPERS ==================
-def col_to_index(col: str) -> int:
-    col = col.strip().upper()
-    if not col:
-        raise ValueError("Leere Spaltenangabe.")
-    n = 0
-    for ch in col:
-        if not ("A" <= ch <= "Z"):
-            raise ValueError(f"Ungültige Spalte: {col}")
-        n = n * 26 + (ord(ch) - ord("A") + 1)
-    return n - 1
-
-
-def index_to_col(idx: int) -> str:
-    idx += 1
-    res = ""
-    while idx:
-        idx, r = divmod(idx - 1, 26)
-        res = chr(r + ord("A")) + res
-    return res
-
-
-def parse_cols_spec(spec: str) -> list[str]:
+def run_compare(*args, **kwargs):
     """
-    Accepts:
-      - "D:K" or "D-K"
-      - "D,E,F" or "D;E;F"
-      - "AA:AD"
-    Returns list of column labels.
+    PLACEHOLDER.
+    -> ERSETZEN durch: from <dein_modul> import run_compare
+    Diese Funktion darf es am Ende NICHT geben.
     """
-    s = spec.strip().upper().replace(" ", "")
-    if not s:
-        raise ValueError("Spaltenbereich ist leer.")
-
-    s = s.replace("-", ":")
-    if ":" in s:
-        start, end = s.split(":", 1)
-        if not start or not end:
-            raise ValueError("Ungültiger Bereich. Beispiel: D:K")
-        a, b = col_to_index(start), col_to_index(end)
-        if b < a:
-            a, b = b, a
-        return [index_to_col(i) for i in range(a, b + 1)]
-
-    parts = [p for p in s.replace(";", ",").split(",") if p]
-    if not parts:
-        raise ValueError("Ungültige Spaltenliste. Beispiel: D,E,F oder D:K")
-    for p in parts:
-        _ = col_to_index(p)
-    return parts
+    raise RuntimeError("run_compare Import nicht gesetzt. Bitte in automation_engine.py anpassen.")
 
 
-def normalize_value(v):
-    if pd.isna(v):
-        return ""
-    if isinstance(v, str):
-        return " ".join(v.split())
-    if isinstance(v, (int, float)):
-        # float-normalization helps avoid 12 vs 12.0 issues
-        return float(v)
-    if isinstance(v, (pd.Timestamp, datetime)):
-        return pd.Timestamp(v).date().isoformat()
-    return str(v)
+# -----------------------------
+# Datenmodelle
+# -----------------------------
+@dataclass(frozen=True)
+class ResolveResult:
+    status: str  # EXACT | GLOB_HIT | MISSING | AMBIGUOUS
+    path: Optional[str]
+    hits: List[str]
+
+@dataclass(frozen=True)
+class Rule:
+    name: str
+
+    a_exact: str
+    a_glob: str
+    a_sheet: str
+    a_key: str
+    a_cols: str
+    a_start: str
+    a_end: str
+
+    b_exact: str
+    b_glob: str
+    b_sheet: str
+    b_key: str
+    b_cols: str
+    b_start: str
+    b_end: str
+
+@dataclass
+class CheckResult:
+    rule_name: str
+    outcome: str  # OK | ABWEICHUNG | SKIP
+    skip_reason: Optional[str]
+    a_resolve: ResolveResult
+    b_resolve: ResolveResult
+    details: List[str]  # Detailzeilen (nur bei ABWEICHUNG, limitiert)
 
 
-# ================== SHEET RESOLUTION ==================
-def resolve_sheet_name(xl: pd.ExcelFile, sheet_spec: str | None) -> str:
-    names = xl.sheet_names
-    if not sheet_spec or not str(sheet_spec).strip():
-        return names[0]
-    s = str(sheet_spec).strip()
-    if s.isdigit():
-        idx = int(s) - 1
-        if idx < 0 or idx >= len(names):
-            raise ValueError(f"Blatt-Nummer {s} existiert nicht. Vorhanden: 1..{len(names)}")
-        return names[idx]
-    if s not in names:
-        raise ValueError(f"Blatt '{s}' nicht gefunden. Vorhanden: {names}")
-    return s
-
-
-def excel_row_to_iloc(row_excel: int) -> int:
-    return row_excel - 1
-
-
-# ================== READ BLOCK (FIXED) ==================
-def read_block(
-    path: str,
-    sheet_spec: str,
-    key_col: str,
-    compare_cols: list[str],
-    row_start_excel: int,
-    row_end_excel: int,
-) -> pd.DataFrame:
+# -----------------------------
+# Period parsing
+# -----------------------------
+def parse_period_INSO(subfolder_name: str) -> Optional[str]:
     """
-    Fixes:
-    1) Kein Spaltenversatz (keine _iloc-Spalte vor den Daten bei Spaltenauswahl).
-    2) Kein Index-Mismatch beim concat (block_df wird reset_index(drop=True) + Excel-Zeilen separat).
+    Erwartet Unterordnernamen wie:
+      '1 Monat_12-2025'   -> 2025-12
+      '3 Quartal_4-2025'  -> 2025-Q4
+      '4 Halbjahr_2-2025' -> 2025-H2
+      '5 Jahr_2025'       -> 2025
     """
-    key_col = key_col.strip().upper()
-    compare_cols = [c.strip().upper() for c in compare_cols]
+    s = subfolder_name.strip()
 
-    xl = pd.ExcelFile(path)
-    sheet_name = resolve_sheet_name(xl, sheet_spec)
+    m = re.search(r"\b1\s*Monat_(\d{1,2})-(\d{4})\b", s)
+    if m:
+        month = int(m.group(1))
+        year = int(m.group(2))
+        if 1 <= month <= 12:
+            return f"{year:04d}-{month:02d}"
+        return None
 
-    df = pd.read_excel(path, sheet_name=sheet_name, header=None, engine="openpyxl")
+    m = re.search(r"\b3\s*Quartal_(\d{1})-(\d{4})\b", s)
+    if m:
+        q = int(m.group(1))
+        year = int(m.group(2))
+        if 1 <= q <= 4:
+            return f"{year:04d}-Q{q}"
+        return None
 
-    needed = [key_col] + compare_cols
-    idxs = [col_to_index(c) for c in needed]
-    max_idx = max(idxs)
-    if df.shape[1] <= max_idx:
-        raise ValueError(
-            f"{os.path.basename(path)} ({sheet_name}) hat nur {df.shape[1]} Spalten, "
-            f"aber du verlangst bis {index_to_col(max_idx)}."
-        )
+    m = re.search(r"\b4\s*Halbjahr_(\d{1})-(\d{4})\b", s)
+    if m:
+        h = int(m.group(1))
+        year = int(m.group(2))
+        if h in (1, 2):
+            return f"{year:04d}-H{h}"
+        return None
 
-    rs, re = int(row_start_excel), int(row_end_excel)
-    if re < rs:
-        rs, re = re, rs
+    m = re.search(r"\b5\s*Jahr_(\d{4})\b", s)
+    if m:
+        year = int(m.group(1))
+        return f"{year:04d}"
 
-    start_i = excel_row_to_iloc(rs)
-    end_i = excel_row_to_iloc(re)
-
-    if start_i < 0:
-        start_i = 0
-    if end_i >= len(df):
-        end_i = len(df) - 1
-    if start_i > end_i:
-        raise ValueError(
-            f"{os.path.basename(path)} ({sheet_name}): Zeilenbereich {row_start_excel}-{row_end_excel} "
-            f"passt nicht zur Datei (zu wenig Zeilen)."
-        )
-
-    # Originalblock aus Excel
-    block_df = df.iloc[start_i:end_i + 1].copy()
-
-    # Excel-Zeilennummern robust (unabhängig vom Pandas-Index)
-    excel_rows = list(range(rs, re + 1))
-
-    # Wichtig: Index auf 0..n-1 setzen, damit concat sauber ausrichtet
-    block_df = block_df.reset_index(drop=True)
-
-    # Datenspalten exakt aus block_df ziehen (keine Verschiebung)
-    data = block_df.iloc[:, idxs].copy()
-    data.columns = needed
-
-    # normalize
-    data[key_col] = data[key_col].apply(normalize_value)
-    for c in compare_cols:
-        data[c] = data[c].apply(normalize_value)
-
-    # Zusammenführen
-    out = pd.concat([pd.Series(excel_rows, name="_excel_row"), data], axis=1)
-
-    # drop empty key
-    out = out[out[key_col] != ""].copy()
-
-    # occurrence per key (order-sensitive!)
-    out["_occ"] = out.groupby(key_col).cumcount() + 1
-    out["_key2"] = out[key_col].astype(str) + "#" + out["_occ"].astype(str)
-
-    # store values as VAL_0..VAL_n-1 for position-based comparison
-    for i, c in enumerate(compare_cols):
-        out[f"VAL_{i}"] = out[c]
-
-    # keep only what we need
-    keep = ["_excel_row", key_col, "_occ", "_key2"] + [f"VAL_{i}" for i in range(len(compare_cols))]
-    out = out[keep].copy()
-
-    out.attrs["sheet_name"] = sheet_name
-    out.attrs["file_name"] = os.path.basename(path)
-    out.attrs["key_col"] = key_col
-    out.attrs["compare_cols"] = compare_cols
-    return out
+    return None
 
 
-# ================== COMPARE BLOCKS ==================
-def compare_blocks(A: pd.DataFrame, B: pd.DataFrame, nvals: int) -> pd.DataFrame:
-    # Merge on key+occurrence: "Zusammen#1", "Zusammen#2", ...
-    m = A.merge(B, on="_key2", how="outer", suffixes=("_A", "_B"), indicator=True)
+# -----------------------------
+# Resolver
+# -----------------------------
+def _glob_search(root: str, pattern: str, recursive: bool) -> List[str]:
+    # pattern kann bereits ** enthalten; wir joinen sauber.
+    # Wir erlauben auch rekursiv: **/<pattern>
+    if recursive:
+        # Wenn pattern keinen path enthält, suchen wir überall
+        if os.sep not in pattern and "/" not in pattern and "\\" not in pattern:
+            full_pattern = os.path.join(root, "**", pattern)
+        else:
+            full_pattern = os.path.join(root, pattern)
+        hits = glob.glob(full_pattern, recursive=True)
+    else:
+        full_pattern = os.path.join(root, pattern)
+        hits = glob.glob(full_pattern, recursive=False)
 
-    def status(row):
-        if row["_merge"] == "left_only":
-            return "FEHLT_IN_B"
-        if row["_merge"] == "right_only":
-            return "FEHLT_IN_A"
-        for i in range(nvals):
-            va = row.get(f"VAL_{i}_A", "")
-            vb = row.get(f"VAL_{i}_B", "")
-            if str(va) != str(vb):
-                return "ABWEICHUNG"
-        return "OK"
-
-    m["STATUS"] = m.apply(status, axis=1)
-
-    # per-position diffs
-    for i in range(nvals):
-        m[f"DIFF_{i}"] = (
-            (m["_merge"] == "both") &
-            (m.get(f"VAL_{i}_A").astype(str) != m.get(f"VAL_{i}_B").astype(str))
-        )
-
-    return m
+    # Nur Dateien, keine Ordner
+    hits = [h for h in hits if os.path.isfile(h)]
+    # Normalize
+    hits = [os.path.normpath(h) for h in hits]
+    return sorted(hits)
 
 
-# ================== REPORTING ==================
-def get_default_output_dir() -> str:
-    """Prefer app dir if writable; otherwise fall back to Documents\\ExcelBlockvergleich."""
-    app_dir = get_base_dir()
+def resolve_file(root: str, exact_name: str, glob_pattern: str,
+                 mode: str = "exact_then_glob",
+                 policy: str = "unique_only",
+                 recursive: bool = True) -> ResolveResult:
+    """
+    Returns ResolveResult with status: EXACT | GLOB_HIT | MISSING | AMBIGUOUS
+    """
+    exact_path = os.path.normpath(os.path.join(root, exact_name)) if exact_name else ""
+    if mode == "exact_then_glob" and exact_name:
+        if os.path.isfile(exact_path):
+            return ResolveResult(status="EXACT", path=exact_path, hits=[exact_path])
 
-    # Try app dir
-    try:
-        test = os.path.join(app_dir, "_write_test.tmp")
-        with open(test, "w", encoding="utf-8") as f:
-            f.write("x")
-        os.remove(test)
-        return app_dir
-    except Exception:
-        pass
+    hits: List[str] = []
+    if glob_pattern:
+        hits = _glob_search(root, glob_pattern, recursive=recursive)
 
-    docs = os.path.join(os.path.expanduser("~"), "Documents", "ExcelBlockvergleich")
-    os.makedirs(docs, exist_ok=True)
-    return docs
+    if policy == "unique_only":
+        if len(hits) == 1:
+            return ResolveResult(status="GLOB_HIT", path=hits[0], hits=hits)
+        if len(hits) == 0:
+            return ResolveResult(status="MISSING", path=None, hits=[])
+        return ResolveResult(status="AMBIGUOUS", path=None, hits=hits)
 
-
-def safe_write_path(filename: str) -> str:
-    out_dir = get_default_output_dir()
-    return os.path.join(out_dir, filename)
-
-
-def sanitize_filename(s: str, max_len: int = 80) -> str:
-    s = (s or "").strip()
-    bad = '\\/:*?"<>|'
-    for ch in bad:
-        s = s.replace(ch, "-")
-    s = s.replace(" ", "-")
-    while "--" in s:
-        s = s.replace("--", "-")
-    s = s.strip("-")
-    if not s:
-        s = "Sheet"
-    return s[:max_len]
+    # fallback (falls du später erweitern willst)
+    if len(hits) >= 1:
+        return ResolveResult(status="GLOB_HIT", path=hits[0], hits=hits)
+    return ResolveResult(status="MISSING", path=None, hits=[])
 
 
-def make_report_filename(sheet_b_name: str, prefix: str = "Pruefprotokoll", ext: str = "txt") -> str:
-    ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    tag = sanitize_filename(sheet_b_name)
-    return f"{prefix}_{tag}_{ts}.{ext}"
-
-
-def write_text_report(
-    m: pd.DataFrame,
-    out_txt_path: str,
-    fileA: str, sheetA: str, keyA: str, colsA: list[str], rsA: int, reA: int,
-    fileB: str, sheetB: str, keyB: str, colsB: list[str], rsB: int, reB: int,
-):
-    any_problem = (m["STATUS"] != "OK").any()
-
-    lines = []
-    lines.append("PRÜFPROTOKOLL")
-    lines.append(f"Version: {__version__} | Build: {__build_date__} | Lauf: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    lines.append(f"Protokollpfad: {out_txt_path}")
-    lines.append(f"A: {fileA} | Blatt: {sheetA} | Key: {keyA} | Spalten: {','.join(colsA)} | Zeilen: {rsA}-{reA}")
-    lines.append(f"B: {fileB} | Blatt: {sheetB} | Key: {keyB} | Spalten: {','.join(colsB)} | Zeilen: {rsB}-{reB}")
-    lines.append("")
-
-    if not any_problem:
-        lines.append("Beide Datenbereiche sind identisch.")
-        with open(out_txt_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines))
-        return
-
-    missA = m[m["STATUS"] == "FEHLT_IN_A"].copy()
-    missB = m[m["STATUS"] == "FEHLT_IN_B"].copy()
-
-    if not missA.empty:
-        lines.append("FEHLT_IN_A (existiert nur in B):")
-        for _, r in missA.iterrows():
-            key_val = r.get(f"{keyB}_B", "")
-            occ = str(r.get("_key2", "")).split("#")[-1]
-            row_b = r.get("_excel_row_B", "")
-            lines.append(f"  Key={key_val} (#{occ}): {fileB} {sheetB} Zeile {row_b}")
-        lines.append("")
-
-    if not missB.empty:
-        lines.append("FEHLT_IN_B (existiert nur in A):")
-        for _, r in missB.iterrows():
-            key_val = r.get(f"{keyA}_A", "")
-            occ = str(r.get("_key2", "")).split("#")[-1]
-            row_a = r.get("_excel_row_A", "")
-            lines.append(f"  Key={key_val} (#{occ}): {fileA} {sheetA} Zeile {row_a}")
-        lines.append("")
-
-    diffs = m[m["STATUS"] == "ABWEICHUNG"].copy()
-    if not diffs.empty:
-        lines.append("ABWEICHUNGEN (Datei Blatt Zelle: Wert / Datei Blatt Zelle: Wert):")
-        for _, r in diffs.iterrows():
-            key_val = r.get(f"{keyA}_A", r.get(f"{keyB}_B", ""))
-            occ = str(r.get("_key2", "")).split("#")[-1]
-            row_a = int(r.get("_excel_row_A")) if pd.notna(r.get("_excel_row_A")) else None
-            row_b = int(r.get("_excel_row_B")) if pd.notna(r.get("_excel_row_B")) else None
-
-            for i in range(min(len(colsA), len(colsB))):
-                if bool(r.get(f"DIFF_{i}", False)):
-                    colA = colsA[i]
-                    colB = colsB[i]
-                    cell_a = f"{colA}{row_a}" if row_a is not None else f"{colA}?"
-                    cell_b = f"{colB}{row_b}" if row_b is not None else f"{colB}?"
-                    va = "" if pd.isna(r.get(f"VAL_{i}_A", "")) else str(r.get(f"VAL_{i}_A", ""))
-                    vb = "" if pd.isna(r.get(f"VAL_{i}_B", "")) else str(r.get(f"VAL_{i}_B", ""))
-                    lines.append(
-                        f"  Key={key_val} (#{occ}) | "
-                        f"{fileA} {sheetA} {cell_a}: {va} / "
-                        f"{fileB} {sheetB} {cell_b}: {vb}"
-                    )
-
-    with open(out_txt_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
-
-
-# ================== FILE HELPERS ==================
-def pick_two_xlsx(folder: str) -> tuple[str, str]:
-    files = sorted(glob.glob(os.path.join(folder, "*.xlsx")))
-    files = [f for f in files if not os.path.basename(f).lower().startswith("pruefprotokoll")]
-    if len(files) == 2:
-        return files[0], files[1]
-    return "", ""
-
-
-def list_sheets(path: str) -> str:
-    xl = pd.ExcelFile(path)
-    names = xl.sheet_names
-    out = [f"{os.path.basename(path)} (Blätter: {len(names)})"]
-    for i, n in enumerate(names, start=1):
-        out.append(f"  {i}: {n}")
-    return "\n".join(out)
-
-
-# ================== INI PRESETS ==================
-INI_NAME = "excel_compare.ini"
-
-
-def load_ini(ini_path: str) -> configparser.ConfigParser:
-    cfg = configparser.ConfigParser()
-    if os.path.exists(ini_path):
-        cfg.read(ini_path, encoding="utf-8")
+# -----------------------------
+# INI Parsing
+# -----------------------------
+def load_config(ini_path: str) -> configparser.ConfigParser:
+    cfg = configparser.ConfigParser(interpolation=None)
+    cfg.optionxform = str  # keys case-sensitive lassen (optional)
+    with open(ini_path, "r", encoding="utf-8") as f:
+        cfg.read_file(f)
     return cfg
 
 
-def save_ini(cfg: configparser.ConfigParser, ini_path: str):
-    with open(ini_path, "w", encoding="utf-8") as f:
-        cfg.write(f)
+def list_automation_profiles(cfg: configparser.ConfigParser) -> List[str]:
+    out = []
+    for sec in cfg.sections():
+        if sec.startswith("AUTOMATION:"):
+            out.append(sec.split("AUTOMATION:", 1)[1])
+    return sorted(out)
 
 
-def preset_sections(cfg: configparser.ConfigParser) -> list[str]:
-    return [s for s in cfg.sections()]
+def _get_required(cfg: configparser.ConfigParser, sec: str, key: str) -> str:
+    if not cfg.has_option(sec, key):
+        raise KeyError(f"INI fehlt: [{sec}] {key}")
+    return cfg.get(sec, key).strip()
 
 
-def apply_preset_to_vars(cfg: configparser.ConfigParser, section: str, vars_map: dict[str, tk.StringVar]):
-    if section not in cfg:
-        raise ValueError(f"Preset '{section}' nicht gefunden.")
-    sec = cfg[section]
-    for k, var in vars_map.items():
-        if k in sec:
-            var.set(sec.get(k, ""))
+def parse_rule_line(line: str) -> Rule:
+    parts = [p.strip() for p in line.split("|")]
+    if len(parts) != 15:
+        raise ValueError(f"Regel hat {len(parts)} Felder, erwartet 15: {line}")
 
+    return Rule(
+        name=parts[0],
 
-def write_vars_to_preset(cfg: configparser.ConfigParser, section: str, vars_map: dict[str, tk.StringVar]):
-    if section not in cfg:
-        cfg.add_section(section)
-    for k, var in vars_map.items():
-        cfg[section][k] = var.get().strip()
+        a_exact=parts[1],
+        a_glob=parts[2],
+        a_sheet=parts[3],
+        a_key=parts[4],
+        a_cols=parts[5],
+        a_start=parts[6],
+        a_end=parts[7],
 
-
-# ================== COMPARE RUNNER ==================
-def run_compare(
-    fileA_path: str, fileB_path: str,
-    sheetA_spec: str, keyA: str, colsA_spec: str, startA: str, endA: str,
-    sheetB_spec: str, keyB: str, colsB_spec: str, startB: str, endB: str,
-):
-    bootlog("START run_compare")
-
-    if not fileA_path or not os.path.exists(fileA_path):
-        raise ValueError("Datei A fehlt oder existiert nicht.")
-    if not fileB_path or not os.path.exists(fileB_path):
-        raise ValueError("Datei B fehlt oder existiert nicht.")
-
-    keyA = keyA.strip().upper()
-    keyB = keyB.strip().upper()
-    _ = col_to_index(keyA)
-    _ = col_to_index(keyB)
-
-    colsA = parse_cols_spec(colsA_spec)
-    colsB = parse_cols_spec(colsB_spec)
-    if len(colsA) != len(colsB):
-        raise ValueError("Vergleichsspalten müssen gleich viele Spalten haben (A und B).")
-
-    for v, name in [(startA, "Startzeile A"), (endA, "Endzeile A"), (startB, "Startzeile B"), (endB, "Endzeile B")]:
-        if not str(v).strip().isdigit():
-            raise ValueError(f"{name} muss eine Zahl sein.")
-
-    rsA, reA = int(startA), int(endA)
-    rsB, reB = int(startB), int(endB)
-
-    A = read_block(fileA_path, sheetA_spec, keyA, colsA, rsA, reA)
-    B = read_block(fileB_path, sheetB_spec, keyB, colsB, rsB, reB)
-
-    nvals = len(colsA)
-    m = compare_blocks(A, B, nvals=nvals)
-
-    sheetA_name = A.attrs.get("sheet_name", sheetA_spec)
-    sheetB_name = B.attrs.get("sheet_name", sheetB_spec)
-
-    out_txt = safe_write_path(make_report_filename(sheet_b_name=sheetB_name))
-
-    write_text_report(
-        m=m,
-        out_txt_path=out_txt,
-        fileA=os.path.basename(fileA_path), sheetA=sheetA_name, keyA=keyA, colsA=colsA, rsA=rsA, reA=reA,
-        fileB=os.path.basename(fileB_path), sheetB=sheetB_name, keyB=keyB, colsB=colsB, rsB=rsB, reB=reB,
+        b_exact=parts[8],
+        b_glob=parts[9],
+        b_sheet=parts[10],
+        b_key=parts[11],
+        b_cols=parts[12],
+        b_start=parts[13],
+        b_end=parts[14],
     )
 
-    return out_txt
+
+def load_rulegroup(cfg: configparser.ConfigParser, group_name: str) -> List[Rule]:
+    sec = f"RULEGROUP:{group_name}"
+    if not cfg.has_section(sec):
+        raise KeyError(f"INI fehlt Regelgruppe: [{sec}]")
+
+    enabled = cfg.get(sec, "enabled", fallback="true").strip().lower() in ("1", "true", "yes", "on")
+    if not enabled:
+        return []
+
+    rules: List[Tuple[str, str]] = []
+    for k, v in cfg.items(sec):
+        if k.startswith("rule."):
+            rules.append((k, v))
+
+    rules.sort(key=lambda kv: kv[0])  # rule.001, rule.002 ...
+    return [parse_rule_line(v) for _, v in rules]
 
 
-# ================== GUI ==================
-def main_gui():
-    bootlog("START main_gui")
+# -----------------------------
+# Report Writer
+# -----------------------------
+class BatchReport:
+    def __init__(self, out_path: str, detail_limit: int = 200) -> None:
+        self.out_path = out_path
+        self.detail_limit = detail_limit
+        self.lines: List[str] = []
+        self.count_ok = 0
+        self.count_abw = 0
+        self.count_skip = 0
+        self.skip_reasons: Dict[str, int] = {}
 
-    folder = get_base_dir()
-    ini_path = os.path.join(folder, INI_NAME)
-    cfg = load_ini(ini_path)
+    def add(self, s: str = "") -> None:
+        self.lines.append(s)
 
-    bootlog("BEFORE tk.Tk")
-    root = tk.Tk()
-    root.title(f"Excel Blockvergleich (v{__version__})")
+    def add_skip(self, reason: str) -> None:
+        self.count_skip += 1
+        self.skip_reasons[reason] = self.skip_reasons.get(reason, 0) + 1
 
-    frm = ttk.Frame(root, padding=12)
-    frm.grid(sticky="nsew")
+    def add_ok(self) -> None:
+        self.count_ok += 1
 
-    # Default file pick: if exactly 2 xlsx in folder
-    f1, f2 = pick_two_xlsx(folder)
+    def add_abw(self) -> None:
+        self.count_abw += 1
 
-    # Variables
-    fileA_var = tk.StringVar(value=f1)
-    fileB_var = tk.StringVar(value=f2)
-
-    preset_var = tk.StringVar(value="")
-
-    sheetA_var = tk.StringVar(value="1")
-    keyA_var = tk.StringVar(value="C")
-    colsA_var = tk.StringVar(value="D:K")
-    startA_var = tk.StringVar(value="14")
-    endA_var = tk.StringVar(value="59")
-
-    sheetB_var = tk.StringVar(value="1")
-    keyB_var = tk.StringVar(value="C")
-    colsB_var = tk.StringVar(value="D:K")
-    startB_var = tk.StringVar(value="16")
-    endB_var = tk.StringVar(value="61")
-
-    # Map keys for INI
-    vars_map = {
-        "fileA": fileA_var,
-        "fileB": fileB_var,
-        "sheetA": sheetA_var,
-        "keyA": keyA_var,
-        "colsA": colsA_var,
-        "startA": startA_var,
-        "endA": endA_var,
-        "sheetB": sheetB_var,
-        "keyB": keyB_var,
-        "colsB": colsB_var,
-        "startB": startB_var,
-        "endB": endB_var,
-    }
-
-    # --- Presets row ---
-    ttk.Label(frm, text="Preset:").grid(column=0, row=0, sticky="w")
-    presets = [""] + preset_sections(cfg)  # empty = none
-    preset_combo = ttk.Combobox(frm, textvariable=preset_var, values=presets, width=30, state="readonly")
-    preset_combo.grid(column=1, row=0, sticky="w")
-
-    def refresh_presets():
-        preset_combo["values"] = [""] + preset_sections(cfg)
-
-    def load_preset():
-        name = preset_var.get().strip()
-        if not name:
-            messagebox.showinfo("Preset", "Bitte ein Preset auswählen.")
-            return
-        apply_preset_to_vars(cfg, name, vars_map)
-        messagebox.showinfo("Preset", f"Preset '{name}' geladen.")
-
-    def save_preset_as():
-        name = simpledialog.askstring("Preset speichern", "Name für das Preset (z.B. Tabelle-1):", parent=root)
-        if not name:
-            return
-        name = name.strip()
-        write_vars_to_preset(cfg, name, vars_map)
-        save_ini(cfg, ini_path)
-        refresh_presets()
-        preset_var.set(name)
-        messagebox.showinfo("Preset", f"Preset '{name}' gespeichert in {INI_NAME}.")
-
-    ttk.Button(frm, text="Preset laden", command=load_preset).grid(column=2, row=0, padx=(10, 0))
-    ttk.Button(frm, text="Preset speichern…", command=save_preset_as).grid(column=3, row=0, padx=(6, 0))
-
-    ttk.Separator(frm, orient="horizontal").grid(column=0, row=1, columnspan=4, sticky="ew", pady=8)
-
-    # --- Files row ---
-    ttk.Label(frm, text="Datei A:").grid(column=0, row=2, sticky="w")
-    ttk.Entry(frm, textvariable=fileA_var, width=55).grid(column=1, row=2, columnspan=2, sticky="w")
-
-    def browse_a():
-        p = filedialog.askopenfilename(title="Datei A wählen", filetypes=[("Excel", "*.xlsx")])
-        if p:
-            fileA_var.set(p)
-
-    ttk.Button(frm, text="…", width=3, command=browse_a).grid(column=3, row=2, sticky="w")
-
-    ttk.Label(frm, text="Datei B:").grid(column=0, row=3, sticky="w")
-    ttk.Entry(frm, textvariable=fileB_var, width=55).grid(column=1, row=3, columnspan=2, sticky="w")
-
-    def browse_b():
-        p = filedialog.askopenfilename(title="Datei B wählen", filetypes=[("Excel", "*.xlsx")])
-        if p:
-            fileB_var.set(p)
-
-    ttk.Button(frm, text="…", width=3, command=browse_b).grid(column=3, row=3, sticky="w")
-
-    def swap_files():
-        a, b = fileA_var.get(), fileB_var.get()
-        fileA_var.set(b)
-        fileB_var.set(a)
-
-    ttk.Button(frm, text="A ↔ B tauschen", command=swap_files).grid(column=2, row=4, sticky="w", pady=(6, 0))
-
-    def show_sheets():
-        try:
-            a = list_sheets(fileA_var.get())
-            b = list_sheets(fileB_var.get())
-            messagebox.showinfo("Blätter anzeigen", a + "\n\n" + b)
-        except Exception as e:
-            messagebox.showerror("Fehler", str(e))
-
-    ttk.Button(frm, text="Blätter anzeigen", command=show_sheets).grid(column=3, row=4, sticky="w", pady=(6, 0))
-
-    ttk.Separator(frm, orient="horizontal").grid(column=0, row=5, columnspan=4, sticky="ew", pady=10)
-
-    # --- Settings columns ---
-    ttk.Label(frm, text="Einstellungen Datei A", font=("Segoe UI", 9, "bold")).grid(column=0, row=6, sticky="w")
-    ttk.Label(frm, text="Einstellungen Datei B", font=("Segoe UI", 9, "bold")).grid(column=2, row=6, sticky="w")
-
-    # A fields
-    ttk.Label(frm, text="Blatt (Nr/Name):").grid(column=0, row=7, sticky="w")
-    ttk.Entry(frm, textvariable=sheetA_var, width=10).grid(column=1, row=7, sticky="w")
-
-    ttk.Label(frm, text="Schlüsselspalte:").grid(column=0, row=8, sticky="w")
-    ttk.Entry(frm, textvariable=keyA_var, width=10).grid(column=1, row=8, sticky="w")
-
-    ttk.Label(frm, text="Vergleichsspalten:").grid(column=0, row=9, sticky="w")
-    ttk.Entry(frm, textvariable=colsA_var, width=10).grid(column=1, row=9, sticky="w")
-
-    ttk.Label(frm, text="Startzeile:").grid(column=0, row=10, sticky="w")
-    ttk.Entry(frm, textvariable=startA_var, width=10).grid(column=1, row=10, sticky="w")
-
-    ttk.Label(frm, text="Endzeile:").grid(column=0, row=11, sticky="w")
-    ttk.Entry(frm, textvariable=endA_var, width=10).grid(column=1, row=11, sticky="w")
-
-    # B fields
-    ttk.Label(frm, text="Blatt (Nr/Name):").grid(column=2, row=7, sticky="w")
-    ttk.Entry(frm, textvariable=sheetB_var, width=10).grid(column=3, row=7, sticky="w")
-
-    ttk.Label(frm, text="Schlüsselspalte:").grid(column=2, row=8, sticky="w")
-    ttk.Entry(frm, textvariable=keyB_var, width=10).grid(column=3, row=8, sticky="w")
-
-    ttk.Label(frm, text="Vergleichsspalten:").grid(column=2, row=9, sticky="w")
-    ttk.Entry(frm, textvariable=colsB_var, width=10).grid(column=3, row=9, sticky="w")
-
-    ttk.Label(frm, text="Startzeile:").grid(column=2, row=10, sticky="w")
-    ttk.Entry(frm, textvariable=startB_var, width=10).grid(column=3, row=10, sticky="w")
-
-    ttk.Label(frm, text="Endzeile:").grid(column=2, row=11, sticky="w")
-    ttk.Entry(frm, textvariable=endB_var, width=10).grid(column=3, row=11, sticky="w")
-
-    ttk.Separator(frm, orient="horizontal").grid(column=0, row=12, columnspan=4, sticky="ew", pady=10)
-
-    status = tk.StringVar(value=f"Ausgabeordner: {get_default_output_dir()} | Presets: {INI_NAME}")
-    ttk.Label(frm, textvariable=status, foreground="gray").grid(column=0, row=13, columnspan=4, sticky="w")
-
-    def show_about():
-        exe_path = sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__)
-        out_dir = get_default_output_dir()
-        info = (
-            f"Excel Blockvergleich\n"
-            f"Version: {__version__} (Build: {__build_date__})\n\n"
-            f"Programm: {exe_path}\n"
-            f"INI: {ini_path}\n"
-            f"Ausgabeordner: {out_dir}\n"
-        )
-        messagebox.showinfo("Über", info)
-
-    def on_start():
-        try:
-            out_txt = run_compare(
-                fileA_var.get(), fileB_var.get(),
-                sheetA_var.get(), keyA_var.get(), colsA_var.get(), startA_var.get(), endA_var.get(),
-                sheetB_var.get(), keyB_var.get(), colsB_var.get(), startB_var.get(), endB_var.get(),
-            )
-            messagebox.showinfo("Fertig", f"Protokoll:\n{out_txt}")
-            status.set(f"OK: {out_txt}")
-        except Exception as e:
-            messagebox.showerror("Fehler", str(e))
-            status.set(f"Fehler: {e}")
-
-    ttk.Button(frm, text="Start Vergleich", command=on_start).grid(column=0, row=14, sticky="w")
-    ttk.Button(frm, text="Beenden", command=root.destroy).grid(column=1, row=14, sticky="w")
-    ttk.Button(frm, text="Über…", command=show_about).grid(column=2, row=14, sticky="w")
-
-    root.mainloop()
+    def flush(self) -> None:
+        os.makedirs(os.path.dirname(self.out_path), exist_ok=True)
+        with open(self.out_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(self.lines))
 
 
-if __name__ == "__main__":
-    main_gui()
+# -----------------------------
+# Subfolder pairing
+# -----------------------------
+def _list_subfolders(path: str) -> List[str]:
+    if not os.path.isdir(path):
+        return []
+    items = []
+    for name in os.listdir(path):
+        p = os.path.join(path, name)
+        if os.path.isdir(p):
+            items.append(name)
+    return sorted(items)
+
+
+def _prefix_of_subfolder(name: str) -> Optional[str]:
+    m = re.match(r"^\s*([1-9])\s+", name)
+    if m:
+        return m.group(1)
+    return None
+
+
+def build_pairs(start_dir: str, folder_a: str, folder_b: str,
+                subfolder_mode: str, allowed_prefixes: List[str]) -> List[Tuple[str, str, Optional[str]]]:
+    """
+    Returns list of (a_dir, b_dir, subfolder_name_or_None)
+    """
+    base_a = os.path.join(start_dir, folder_a)
+    base_b = os.path.join(start_dir, folder_b)
+
+    if subfolder_mode == "none":
+        return [(base_a, base_b, None)]
+
+    subs_a = _list_subfolders(base_a)
+    subs_b = _list_subfolders(base_b)
+
+    if subfolder_mode == "name_equal":
+        common = sorted(set(subs_a).intersection(subs_b))
+        return [(os.path.join(base_a, s), os.path.join(base_b, s), s) for s in common]
+
+    if subfolder_mode == "prefix_map":
+        # Map prefix -> list of folder names (normalerweise je prefix genau 1, aber wir bleiben defensiv)
+        map_a: Dict[str, List[str]] = {}
+        map_b: Dict[str, List[str]] = {}
+
+        for s in subs_a:
+            px = _prefix_of_subfolder(s)
+            if px and px in allowed_prefixes:
+                map_a.setdefault(px, []).append(s)
+
+        for s in subs_b:
+            px = _prefix_of_subfolder(s)
+            if px and px in allowed_prefixes:
+                map_b.setdefault(px, []).append(s)
+
+        pairs: List[Tuple[str, str, Optional[str]]] = []
+        for px in allowed_prefixes:
+            la = map_a.get(px, [])
+            lb = map_b.get(px, [])
+            # Wenn je prefix mehrere -> wir paaren nach Namen, sonst SKIP später (Engine kann das als Missing/Ambiguous behandeln)
+            # Hier: simplest pairing by exact same folder name intersection, otherwise pair firsts if both exist.
+            inter = sorted(set(la).intersection(lb))
+            if inter:
+                for s in inter:
+                    pairs.append((os.path.join(base_a, s), os.path.join(base_b, s), s))
+            else:
+                if la and lb:
+                    pairs.append((os.path.join(base_a, la[0]), os.path.join(base_b, lb[0]), la[0]))
+                # else: fehlt -> wird im Runner als MissingFolder/Skip gezählt, weil Pair gar nicht entsteht
+        return pairs
+
+    raise ValueError(f"Unbekannter subfolder_mode: {subfolder_mode}")
+
+
+# -----------------------------
+# Runner
+# -----------------------------
+def _apply_period(s: str, period: str) -> str:
+    return (s or "").replace("{PERIOD}", period)
+
+
+def run_automation(
+    ini_path: str,
+    profile_name: str,
+    start_dir: str,
+    report_out_dir: str,
+) -> str:
+    """
+    Führt ein Automatik-Profil aus.
+    Gibt den Pfad zum Sammelreport zurück.
+    """
+    cfg = load_config(ini_path)
+    prof_sec = f"AUTOMATION:{profile_name}"
+    if not cfg.has_section(prof_sec):
+        raise KeyError(f"Profil nicht gefunden: [{prof_sec}]")
+
+    folder_a = _get_required(cfg, prof_sec, "folder_a")
+    folder_b = _get_required(cfg, prof_sec, "folder_b")
+
+    subfolder_mode = cfg.get(prof_sec, "subfolder_mode", fallback="none").strip()
+    prefixes_raw = cfg.get(prof_sec, "subfolder_prefixes", fallback="").strip()
+    allowed_prefixes = [p.strip() for p in prefixes_raw.split(",") if p.strip()]
+
+    period_mode = cfg.get(prof_sec, "period_mode", fallback="INSO").strip()
+
+    resolve_mode = cfg.get(prof_sec, "resolve_mode", fallback="exact_then_glob").strip()
+    resolve_policy = cfg.get(prof_sec, "resolve_policy", fallback="unique_only").strip()
+    glob_recursive = cfg.get(prof_sec, "glob_recursive", fallback="true").strip().lower() in ("1", "true", "yes", "on")
+
+    detail_limit = int(cfg.get(prof_sec, "detail_max_lines_per_check", fallback="200"))
+
+    rulegroups_raw = _get_required(cfg, prof_sec, "rulegroups")
+    rulegroups = [g.strip() for g in rulegroups_raw.split(",") if g.strip()]
+
+    # Report file name
+    ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    report_name = f"AUTOMATION_{profile_name}_{ts}.txt"
+    report_path = os.path.join(report_out_dir, report_name)
+
+    rep = BatchReport(report_path, detail_limit=detail_limit)
+
+    rep.add("Excel Blockvergleich – Sammelreport (Automatik)")
+    rep.add(f"Profil: {profile_name}")
+    rep.add(f"Startordner: {os.path.normpath(start_dir)}")
+    rep.add(f"Folder A: {folder_a}")
+    rep.add(f"Folder B: {folder_b}")
+    rep.add(f"Subfolder-Mode: {subfolder_mode}")
+    rep.add(f"Resolver: {resolve_mode} / {resolve_policy} / recursive={glob_recursive}")
+    rep.add(f"Rulegroups: {', '.join(rulegroups)}")
+    rep.add("".ljust(80, "-"))
+
+    # Build subfolder pairs
+    pairs = build_pairs(start_dir, folder_a, folder_b, subfolder_mode, allowed_prefixes)
+
+    if not pairs:
+        rep.add("KEINE passenden Ordnerpaare gefunden -> alles SKIP.")
+        rep.add_skip("NoPairsFound")
+        rep.flush()
+        return report_path
+
+    # For each pair: detect period, run all rulegroups
+    for (adir, bdir, subname) in pairs:
+        rep.add("")
+        rep.add("".ljust(80, "="))
+        rep.add(f"Ordnerpaar:")
+        rep.add(f"  A: {os.path.normpath(adir)}")
+        rep.add(f"  B: {os.path.normpath(bdir)}")
+        rep.add(f"  Subfolder: {subname or '(none)'}")
+
+        if not os.path.isdir(adir):
+            rep.add("  -> SKIP: Folder A fehlt")
+            rep.add_skip("MissingFolderA")
+            continue
+        if not os.path.isdir(bdir):
+            rep.add("  -> SKIP: Folder B fehlt")
+            rep.add_skip("MissingFolderB")
+            continue
+
+        # Period
+        period = ""
+        if subname:
+            if period_mode.upper() == "INSO":
+                p = parse_period_INSO(subname)
+                if not p:
+                    rep.add("  -> SKIP: PERIOD konnte nicht erkannt werden")
+                    rep.add_skip("PeriodParseFailed")
+                    continue
+                period = p
+            else:
+                rep.add(f"  -> SKIP: Unbekannter period_mode={period_mode}")
+                rep.add_skip("UnknownPeriodMode")
+                continue
+        else:
+            # no subfolder -> optional: period leer lassen
+            period = ""
+
+        rep.add(f"  PERIOD: {period or '(empty)'}")
+        rep.add("".ljust(80, "-"))
+
+        # Load rules once per pair
+        for gname in rulegroups:
+            rules = load_rulegroup(cfg, gname)
+            if not rules:
+                rep.add(f"[{gname}] (disabled/leer) -> übersprungen")
+                continue
+
+            rep.add(f"[{gname}] Regeln: {len(rules)}")
+
+            for rule in rules:
+                # Apply period placeholder
+                a_exact = _apply_period(rule.a_exact, period)
+                a_glob = _apply_period(rule.a_glob, period)
+                b_exact = _apply_period(rule.b_exact, period)
+                b_glob = _apply_period(rule.b_glob, period)
+
+                a_sheet = _apply_period(rule.a_sheet, period)
+                b_sheet = _apply_period(rule.b_sheet, period)
+
+                rep.add("")
+                rep.add(f"CHECK: {rule.name}")
+                rep.add(f"  A: exact='{a_exact}' glob='{a_glob}' sheet='{a_sheet}'")
+                rep.add(f"     key='{rule.a_key}' cols='{rule.a_cols}' start='{rule.a_start}' end='{rule.a_end}'")
+                rep.add(f"  B: exact='{b_exact}' glob='{b_glob}' sheet='{b_sheet}'")
+                rep.add(f"     key='{rule.b_key}' cols='{rule.b_cols}' start='{rule.b_start}' end='{rule.b_end}'")
+
+                # Resolve A/B
+                a_res = resolve_file(adir, a_exact, a_glob, mode=resolve_mode, policy=resolve_policy, recursive=glob_recursive)
+                b_res = resolve_file(bdir, b_exact, b_glob, mode=resolve_mode, policy=resolve_policy, recursive=glob_recursive)
+
+                rep.add(f"  RESOLVE A: {a_res.status}" + (f" -> {a_res.path}" if a_res.path else ""))
+                if a_res.status == "AMBIGUOUS":
+                    rep.add(f"           hits={len(a_res.hits)}")
+                rep.add(f"  RESOLVE B: {b_res.status}" + (f" -> {b_res.path}" if b_res.path else ""))
+                if b_res.status == "AMBIGUOUS":
+                    rep.add(f"           hits={len(b_res.hits)}")
+
+                # Policy handling: if missing/ambiguous => SKIP
+                if a_res.status in ("MISSING", "AMBIGUOUS"):
+                    reason = "MissingA" if a_res.status == "MISSING" else "AmbiguousA"
+                    rep.add(f"  RESULT: SKIP ({reason})")
+                    rep.add_skip(reason)
+                    continue
+                if b_res.status in ("MISSING", "AMBIGUOUS"):
+                    reason = "MissingB" if b_res.status == "MISSING" else "AmbiguousB"
+                    rep.add(f"  RESULT: SKIP ({reason})")
+                    rep.add_skip(reason)
+                    continue
+
+                # Call core compare (Blackbox)
+                # Erwartung: run_compare liefert mindestens:
+                #   - status/outcome (OK/ABWEICHUNG/...) und optional Detailzeilen
+                # Da wir deinen Prüfkern nicht kennen, kapseln wir defensiv.
+                try:
+                    core_result = run_compare(
+                        file_a=a_res.path,
+                        sheet_a=a_sheet,
+                        key_a=rule.a_key,
+                        cols_a=rule.a_cols,
+                        start_a=rule.a_start,
+                        end_a=rule.a_end,
+                        file_b=b_res.path,
+                        sheet_b=b_sheet,
+                        key_b=rule.b_key,
+                        cols_b=rule.b_cols,
+                        start_b=rule.b_start,
+                        end_b=rule.b_end,
+                        header=None,  # du sagtest header-unabhängig; wenn dein Prüfkern das so bekommt
+                        automation=True,  # optional, falls du im Kern ignorierst: ok
+                    )
+                except TypeError:
+                    # Falls run_compare andere Signatur hat: du passt hier die Parameternamen an,
+                    # ohne den Kern selbst zu ändern.
+                    core_result = run_compare(
+                        a_res.path, a_sheet, rule.a_key, rule.a_cols, rule.a_start, rule.a_end,
+                        b_res.path, b_sheet, rule.b_key, rule.b_cols, rule.b_start, rule.b_end
+                    )
+                except Exception as e:
+                    rep.add(f"  RESULT: SKIP (Exception)")
+                    rep.add(f"  EXCEPTION: {type(e).__name__}: {e}")
+                    rep.add_skip("Exception")
+                    continue
+
+                # Interpret core_result
+                outcome, details = normalize_core_result(core_result)
+
+                if outcome == "OK":
+                    rep.add("  RESULT: OK")
+                    rep.add_ok()
+                elif outcome == "ABWEICHUNG":
+                    rep.add("  RESULT: ABWEICHUNG")
+                    rep.add_abw()
+                    if details:
+                        rep.add("  DETAILS:")
+                        for line in details[:rep.detail_limit]:
+                            rep.add(f"    {line}")
+                        if len(details) > rep.detail_limit:
+                            rep.add(f"    ... (gekürzt, {len(details)-rep.detail_limit} weitere Zeilen)")
+                else:
+                    # Alles andere behandeln wir als SKIP, um nicht zu "lügen"
+                    rep.add(f"  RESULT: SKIP (UnknownOutcome:{outcome})")
+                    rep.add_skip(f"UnknownOutcome:{outcome}")
+
+    # Summary
+    rep.add("")
+    rep.add("".ljust(80, "="))
+    rep.add("SUMMARY")
+    rep.add(f"OK: {rep.count_ok}")
+    rep.add(f"ABWEICHUNG: {rep.count_abw}")
+    rep.add(f"SKIP: {rep.count_skip}")
+    if rep.skip_reasons:
+        rep.add("")
+        rep.add("SKIP-Gründe:")
+        for k in sorted(rep.skip_reasons.keys()):
+            rep.add(f"  {k}: {rep.skip_reasons[k]}")
+
+    rep.flush()
+    return report_path
+
+
+def normalize_core_result(core_result) -> Tuple[str, List[str]]:
+    """
+    Versucht, das Ergebnis deines Prüfkerns in (outcome, details[]) zu normalisieren.
+    Du passt das ggf. minimal an, je nachdem was run_compare wirklich zurückgibt.
+    """
+    # Fall 1: dict
+    if isinstance(core_result, dict):
+        outcome = str(core_result.get("outcome") or core_result.get("status") or "").upper()
+        details = core_result.get("details") or core_result.get("lines") or []
+        if isinstance(details, str):
+            details = [details]
+        details = [str(x) for x in details]
+        return map_outcome(outcome), details
+
+    # Fall 2: tuple (outcome, details)
+    if isinstance(core_result, tuple) and len(core_result) >= 1:
+        outcome = str(core_result[0]).upper()
+        details: List[str] = []
+        if len(core_result) >= 2:
+            d = core_result[1]
+            if isinstance(d, list):
+                details = [str(x) for x in d]
+            elif isinstance(d, str):
+                details = [d]
+        return map_outcome(outcome), details
+
+    # Fall 3: string
+    if isinstance(core_result, str):
+        return map_outcome(core_result.upper()), []
+
+    # Unknown
+    return "UNKNOWN", []
+
+
+def map_outcome(s: str) -> str:
+    s = (s or "").strip().upper()
+    if s in ("OK",):
+        return "OK"
+    if s in ("ABWEICHUNG", "DIFF", "DIFFERENT", "MISMATCH"):
+        return "ABWEICHUNG"
+    if s in ("FEHLT_IN_A", "FEHLT_IN_B", "MISSING_IN_A", "MISSING_IN_B"):
+        # Im Automatikmodus willst du das fachlich eher als ABWEICHUNG behandeln
+        return "ABWEICHUNG"
+    if s in ("SKIP",):
+        return "SKIP"
+    return s or "UNKNOWN"

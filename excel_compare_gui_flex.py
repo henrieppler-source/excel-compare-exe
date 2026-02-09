@@ -8,10 +8,11 @@ import pandas as pd
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 
-__version__ = "2.0.0"
-__build_date__ = "2026-02-04"
+__version__ = "2.0.2"
+__build_date__ = "2026-02-09"
 
 
+# ================== PATH / LOG ==================
 def get_base_dir() -> str:
     # In EXE: Ordner der EXE. Im Script: Ordner der .py
     if getattr(sys, "frozen", False):
@@ -28,7 +29,7 @@ def bootlog(msg: str):
         pass
 
 
-# ---------------- Excel column helpers ----------------
+# ================== EXCEL COLUMN HELPERS ==================
 def col_to_index(col: str) -> int:
     col = col.strip().upper()
     if not col:
@@ -51,6 +52,13 @@ def index_to_col(idx: int) -> str:
 
 
 def parse_cols_spec(spec: str) -> list[str]:
+    """
+    Accepts:
+      - "D:K" or "D-K"
+      - "D,E,F" or "D;E;F"
+      - "AA:AD"
+    Returns list of column labels.
+    """
     s = spec.strip().upper().replace(" ", "")
     if not s:
         raise ValueError("Spaltenbereich ist leer.")
@@ -79,13 +87,14 @@ def normalize_value(v):
     if isinstance(v, str):
         return " ".join(v.split())
     if isinstance(v, (int, float)):
+        # float-normalization helps avoid 12 vs 12.0 issues
         return float(v)
     if isinstance(v, (pd.Timestamp, datetime)):
         return pd.Timestamp(v).date().isoformat()
     return str(v)
 
 
-# ---------------- Sheet resolution ----------------
+# ================== SHEET RESOLUTION ==================
 def resolve_sheet_name(xl: pd.ExcelFile, sheet_spec: str | None) -> str:
     names = xl.sheet_names
     if not sheet_spec or not str(sheet_spec).strip():
@@ -105,11 +114,7 @@ def excel_row_to_iloc(row_excel: int) -> int:
     return row_excel - 1
 
 
-def iloc_to_excel_row(iloc: int) -> int:
-    return iloc + 1
-
-
-# ---------------- Read block (header=None) ----------------
+# ================== READ BLOCK (FIXED) ==================
 def read_block(
     path: str,
     sheet_spec: str,
@@ -119,10 +124,9 @@ def read_block(
     row_end_excel: int,
 ) -> pd.DataFrame:
     """
-    BUGFIX (wichtig):
-    - Wir dürfen für die Spaltenauswahl NICHT das DataFrame verwenden, das durch reset_index()
-      vorne eine Zusatzspalte (_iloc) bekommen hat.
-    - Sonst verschiebt sich alles um 1 und z.B. B:M wird effektiv A:L.
+    Fixes:
+    1) Kein Spaltenversatz (keine _iloc-Spalte vor den Daten bei Spaltenauswahl).
+    2) Kein Index-Mismatch beim concat (block_df wird reset_index(drop=True) + Excel-Zeilen separat).
     """
     key_col = key_col.strip().upper()
     compare_cols = [c.strip().upper() for c in compare_cols]
@@ -158,22 +162,26 @@ def read_block(
             f"passt nicht zur Datei (zu wenig Zeilen)."
         )
 
-    # 1) Originalblock OHNE reset_index (für die Spaltenauswahl!)
+    # Originalblock aus Excel
     block_df = df.iloc[start_i:end_i + 1].copy()
 
-    # 2) Separates Block-DF mit _iloc nur für Excel-Zeilennummer
-    block = block_df.reset_index(drop=False).rename(columns={"index": "_iloc"})
-    block["_excel_row"] = block["_iloc"].apply(iloc_to_excel_row)
+    # Excel-Zeilennummern robust (unabhängig vom Pandas-Index)
+    excel_rows = list(range(rs, re + 1))
 
-    # 3) Datenspalten korrekt aus block_df ziehen (keine Verschiebung!)
+    # Wichtig: Index auf 0..n-1 setzen, damit concat sauber ausrichtet
+    block_df = block_df.reset_index(drop=True)
+
+    # Datenspalten exakt aus block_df ziehen (keine Verschiebung)
     data = block_df.iloc[:, idxs].copy()
     data.columns = needed
 
+    # normalize
     data[key_col] = data[key_col].apply(normalize_value)
     for c in compare_cols:
         data[c] = data[c].apply(normalize_value)
 
-    out = pd.concat([block[["_excel_row"]].copy(), data], axis=1)
+    # Zusammenführen
+    out = pd.concat([pd.Series(excel_rows, name="_excel_row"), data], axis=1)
 
     # drop empty key
     out = out[out[key_col] != ""].copy()
@@ -186,6 +194,7 @@ def read_block(
     for i, c in enumerate(compare_cols):
         out[f"VAL_{i}"] = out[c]
 
+    # keep only what we need
     keep = ["_excel_row", key_col, "_occ", "_key2"] + [f"VAL_{i}" for i in range(len(compare_cols))]
     out = out[keep].copy()
 
@@ -196,8 +205,9 @@ def read_block(
     return out
 
 
-# ---------------- Compare blocks (order-sensitive duplicates) ----------------
+# ================== COMPARE BLOCKS ==================
 def compare_blocks(A: pd.DataFrame, B: pd.DataFrame, nvals: int) -> pd.DataFrame:
+    # Merge on key+occurrence: "Zusammen#1", "Zusammen#2", ...
     m = A.merge(B, on="_key2", how="outer", suffixes=("_A", "_B"), indicator=True)
 
     def status(row):
@@ -214,6 +224,7 @@ def compare_blocks(A: pd.DataFrame, B: pd.DataFrame, nvals: int) -> pd.DataFrame
 
     m["STATUS"] = m.apply(status, axis=1)
 
+    # per-position diffs
     for i in range(nvals):
         m[f"DIFF_{i}"] = (
             (m["_merge"] == "both") &
@@ -223,10 +234,12 @@ def compare_blocks(A: pd.DataFrame, B: pd.DataFrame, nvals: int) -> pd.DataFrame
     return m
 
 
-# ---------------- Reporting ----------------
+# ================== REPORTING ==================
 def get_default_output_dir() -> str:
+    """Prefer app dir if writable; otherwise fall back to Documents\\ExcelBlockvergleich."""
     app_dir = get_base_dir()
 
+    # Try app dir
     try:
         test = os.path.join(app_dir, "_write_test.tmp")
         with open(test, "w", encoding="utf-8") as f:
@@ -336,7 +349,7 @@ def write_text_report(
         f.write("\n".join(lines))
 
 
-# ---------------- File helpers ----------------
+# ================== FILE HELPERS ==================
 def pick_two_xlsx(folder: str) -> tuple[str, str]:
     files = sorted(glob.glob(os.path.join(folder, "*.xlsx")))
     files = [f for f in files if not os.path.basename(f).lower().startswith("pruefprotokoll")]
@@ -354,7 +367,7 @@ def list_sheets(path: str) -> str:
     return "\n".join(out)
 
 
-# ---------------- INI Presets ----------------
+# ================== INI PRESETS ==================
 INI_NAME = "excel_compare.ini"
 
 
@@ -390,7 +403,7 @@ def write_vars_to_preset(cfg: configparser.ConfigParser, section: str, vars_map:
         cfg[section][k] = var.get().strip()
 
 
-# ---------------- Compare runner ----------------
+# ================== COMPARE RUNNER ==================
 def run_compare(
     fileA_path: str, fileB_path: str,
     sheetA_spec: str, keyA: str, colsA_spec: str, startA: str, endA: str,
@@ -423,7 +436,8 @@ def run_compare(
     A = read_block(fileA_path, sheetA_spec, keyA, colsA, rsA, reA)
     B = read_block(fileB_path, sheetB_spec, keyB, colsB, rsB, reB)
 
-    m = compare_blocks(A, B, nvals=len(colsA))
+    nvals = len(colsA)
+    m = compare_blocks(A, B, nvals=nvals)
 
     sheetA_name = A.attrs.get("sheet_name", sheetA_spec)
     sheetB_name = B.attrs.get("sheet_name", sheetB_spec)
@@ -440,7 +454,7 @@ def run_compare(
     return out_txt
 
 
-# ---------------- GUI ----------------
+# ================== GUI ==================
 def main_gui():
     bootlog("START main_gui")
 
@@ -455,8 +469,10 @@ def main_gui():
     frm = ttk.Frame(root, padding=12)
     frm.grid(sticky="nsew")
 
+    # Default file pick: if exactly 2 xlsx in folder
     f1, f2 = pick_two_xlsx(folder)
 
+    # Variables
     fileA_var = tk.StringVar(value=f1)
     fileB_var = tk.StringVar(value=f2)
 
@@ -474,6 +490,7 @@ def main_gui():
     startB_var = tk.StringVar(value="16")
     endB_var = tk.StringVar(value="61")
 
+    # Map keys for INI
     vars_map = {
         "fileA": fileA_var,
         "fileB": fileB_var,
@@ -491,7 +508,7 @@ def main_gui():
 
     # --- Presets row ---
     ttk.Label(frm, text="Preset:").grid(column=0, row=0, sticky="w")
-    presets = [""] + preset_sections(cfg)
+    presets = [""] + preset_sections(cfg)  # empty = none
     preset_combo = ttk.Combobox(frm, textvariable=preset_var, values=presets, width=30, state="readonly")
     preset_combo.grid(column=1, row=0, sticky="w")
 
@@ -562,9 +579,11 @@ def main_gui():
 
     ttk.Separator(frm, orient="horizontal").grid(column=0, row=5, columnspan=4, sticky="ew", pady=10)
 
+    # --- Settings columns ---
     ttk.Label(frm, text="Einstellungen Datei A", font=("Segoe UI", 9, "bold")).grid(column=0, row=6, sticky="w")
     ttk.Label(frm, text="Einstellungen Datei B", font=("Segoe UI", 9, "bold")).grid(column=2, row=6, sticky="w")
 
+    # A fields
     ttk.Label(frm, text="Blatt (Nr/Name):").grid(column=0, row=7, sticky="w")
     ttk.Entry(frm, textvariable=sheetA_var, width=10).grid(column=1, row=7, sticky="w")
 
@@ -580,6 +599,7 @@ def main_gui():
     ttk.Label(frm, text="Endzeile:").grid(column=0, row=11, sticky="w")
     ttk.Entry(frm, textvariable=endA_var, width=10).grid(column=1, row=11, sticky="w")
 
+    # B fields
     ttk.Label(frm, text="Blatt (Nr/Name):").grid(column=2, row=7, sticky="w")
     ttk.Entry(frm, textvariable=sheetB_var, width=10).grid(column=3, row=7, sticky="w")
 

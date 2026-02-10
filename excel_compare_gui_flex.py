@@ -1,4 +1,3 @@
-import os
 import sys
 import glob
 from datetime import datetime
@@ -13,7 +12,7 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-__version__ = "0.0.1"
+__version__ = "0.0.2"
 __build_date__ = "2026-02-10"
 
 
@@ -127,14 +126,17 @@ def read_block(
     compare_cols: list[str],
     row_start_excel: int,
     row_end_excel: int,
+    key_fallback: str = "none",  # none | row_number
 ) -> pd.DataFrame:
     """
     Fixes:
     1) Kein Spaltenversatz (keine _iloc-Spalte vor den Daten bei Spaltenauswahl).
     2) Kein Index-Mismatch beim concat (block_df wird reset_index(drop=True) + Excel-Zeilen separat).
+    3) Optional: key_fallback=row_number -> wenn Schlüsselzelle leer ist, wird ROW:<ExcelZeile> als Schlüssel gesetzt.
     """
     key_col = key_col.strip().upper()
     compare_cols = [c.strip().upper() for c in compare_cols]
+    key_fallback = (key_fallback or "none").strip().lower()
 
     xl = pd.ExcelFile(path)
     sheet_name = resolve_sheet_name(xl, sheet_spec)
@@ -150,12 +152,12 @@ def read_block(
             f"aber du verlangst bis {index_to_col(max_idx)}."
         )
 
-    rs, re = int(row_start_excel), int(row_end_excel)
-    if re < rs:
-        rs, re = re, rs
+    rs, re_ = int(row_start_excel), int(row_end_excel)
+    if re_ < rs:
+        rs, re_ = re_, rs
 
     start_i = excel_row_to_iloc(rs)
-    end_i = excel_row_to_iloc(re)
+    end_i = excel_row_to_iloc(re_)
 
     if start_i < 0:
         start_i = 0
@@ -171,7 +173,7 @@ def read_block(
     block_df = df.iloc[start_i:end_i + 1].copy()
 
     # Excel-Zeilennummern robust (unabhängig vom Pandas-Index)
-    excel_rows = list(range(rs, re + 1))
+    excel_rows = list(range(rs, re_ + 1))
 
     # Wichtig: Index auf 0..n-1 setzen, damit concat sauber ausrichtet
     block_df = block_df.reset_index(drop=True)
@@ -188,8 +190,17 @@ def read_block(
     # Zusammenführen
     out = pd.concat([pd.Series(excel_rows, name="_excel_row"), data], axis=1)
 
-    # drop empty key
-    out = out[out[key_col] != ""].copy()
+    # key fallback (optional)
+    fallback_rows: list[int] = []
+    if key_fallback == "row_number":
+        mask = out[key_col] == ""
+        if mask.any():
+            fallback_rows = out.loc[mask, "_excel_row"].astype(int).tolist()
+            out.loc[mask, key_col] = "ROW:" + out.loc[mask, "_excel_row"].astype(int).astype(str)
+
+    # drop empty key (only if fallback disabled)
+    if key_fallback != "row_number":
+        out = out[out[key_col] != ""].copy()
 
     # occurrence per key (order-sensitive!)
     out["_occ"] = out.groupby(key_col).cumcount() + 1
@@ -207,6 +218,8 @@ def read_block(
     out.attrs["file_name"] = os.path.basename(path)
     out.attrs["key_col"] = key_col
     out.attrs["compare_cols"] = compare_cols
+    out.attrs["key_fallback"] = key_fallback
+    out.attrs["fallback_rows"] = fallback_rows
     return out
 
 
@@ -561,9 +574,11 @@ def resolve_file(
     return ResolveResult("MISSING", None, [], exact_name)
 
 def make_automation_report_filename(profile_name: str) -> str:
-    ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    # YYYYMMDD_HHMMSS_... for better sorting
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     tag = sanitize_filename(profile_name)
-    return f"Pruefprotokoll_Automatik_{tag}_{ts}.txt"
+    return f"{ts}_Pruefprotokoll_Automatik_{tag}.txt"
+
 
 def read_report_lines(path: str) -> list[str]:
     try:
@@ -625,7 +640,12 @@ def run_automation(cfg: configparser.ConfigParser, ini_path: str, automation_sec
         raise ValueError("rule_groups ist leer im Automation-Profil.")
 
     report_max_detail_lines = int(asec.get("report_max_detail_lines", "200"))
-    report_only_single = asec.get("report_only_single", "1").strip().lower() in ("1", "true", "yes", "on")
+    report_mode = asec.get("report_mode", "aggregate_only").strip().lower()  # aggregate_only supported
+    if report_mode != "aggregate_only":
+        raise ValueError(f"Unsupported report_mode: {report_mode}")
+
+    # Report output: always in <Startordner>\
+    out_path = os.path.join(start_root, make_automation_report_filename(profile_name))
 
     file_resolve_mode = asec.get("file_resolve_mode", "exact_only").strip().lower()
     glob_apply_to = asec.get("glob_apply_to", "both").strip().lower()
@@ -634,6 +654,9 @@ def run_automation(cfg: configparser.ConfigParser, ini_path: str, automation_sec
     if not glob_patterns:
         glob_patterns = ["{TEMPLATE}"]
 
+    key_fallback_profile = asec.get("key_fallback", "none").strip().lower()  # none | row_number
+
+    # locate roots
     left_abs = os.path.join(start_root, left_root)
     right_abs = os.path.join(start_root, right_root)
     if not os.path.isdir(left_abs):
@@ -641,42 +664,54 @@ def run_automation(cfg: configparser.ConfigParser, ini_path: str, automation_sec
     if not os.path.isdir(right_abs):
         raise ValueError(f"right_root nicht gefunden: {right_abs}")
 
-    out_path = safe_write_path(make_automation_report_filename(profile_name))
+    # ensure report can be created
+    try:
+        os.makedirs(start_root, exist_ok=True)
+    except Exception:
+        pass
 
     t0 = time.time()
     ok_cnt = 0
     abw_cnt = 0
     skip_cnt = 0
-    skip_reasons = {"FOLDER_MISSING": 0, "FILE_MISSING": 0, "AMBIGUOUS": 0, "ERROR": 0}
+    skip_reasons = {"FOLDER_MISSING": 0, "FILE_MISSING": 0, "AMBIGUOUS": 0, "RULE_DISABLED": 0, "RULE_SKIPPED": 0, "ERROR": 0}
 
-    def w(line: str = "") -> None:
+    def w(line=""):
         with open(out_path, "a", encoding="utf-8") as f:
             f.write(line + "\n")
 
+    # header
     w("SAMMEL-PRÜFPROTOKOLL (AUTOMATIK)")
     w(f"Profil: {profile_name} ({automation_sec})")
     w(f"Version: {__version__} | Build: {__build_date__} | Lauf: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     w(f"Startordner: {start_root}")
     w(f"Links: {left_root} | Rechts: {right_root}")
     w(f"Rule-Gruppen: {', '.join(rule_groups)}")
+    w(f"Key-Fallback: {key_fallback_profile}")
     w("")
 
-    # Subfolder-Liste links
+    # subfolders
+    left_subs: list[str] = []
     if subfolder_mode == "single_folder":
         left_subs = ["."]
     else:
-        left_subs = [name for name in sorted(os.listdir(left_abs)) if os.path.isdir(os.path.join(left_abs, name))]
+        for name in sorted(os.listdir(left_abs)):
+            p = os.path.join(left_abs, name)
+            if os.path.isdir(p):
+                left_subs.append(name)
 
+    # filter by prefixes if needed
     if subfolder_mode == "prefix_match":
         left_subs = [s for s in left_subs if any(s.startswith(px) for px in subfolder_prefixes)]
 
-    # Rules sammeln
+    # scan rules
     all_rule_secs = list_rule_sections(cfg)
 
+    # helper: get rules for groups
     def rules_for_groups(groups: list[str]) -> list[str]:
-        out: list[str] = []
+        out = []
         for rsec in all_rule_secs:
-            g, _rid = parse_rule_section_name(rsec)
+            g, _id = parse_rule_section_name(rsec)
             if g in groups:
                 out.append(rsec)
         return out
@@ -684,7 +719,195 @@ def run_automation(cfg: configparser.ConfigParser, ini_path: str, automation_sec
     selected_rules = rules_for_groups(rule_groups)
     if not selected_rules:
         w("WARNUNG: Keine Rules gefunden für die angegebenen Rule-Gruppen.")
+        w("")
         return out_path
+
+    # run
+    for sub in left_subs:
+        # match right folder
+        if subfolder_mode == "single_folder":
+            left_dir = left_abs
+            right_dir = right_abs
+            sub_label = "(single_folder)"
+        else:
+            left_dir = os.path.join(left_abs, sub)
+            right_dir = os.path.join(right_abs, sub)
+            sub_label = sub
+
+        if not os.path.isdir(right_dir):
+            skip_cnt += 1
+            skip_reasons["FOLDER_MISSING"] += 1
+            w("=" * 70)
+            w(f"SKIP Unterordner fehlt rechts | {sub_label}")
+            w(f"Rechts erwartet: {right_dir}")
+            continue
+
+        # period detection
+        if period_mode == "none":
+            period_type, period_val = "", ""
+        elif period_mode == "inso_style":
+            try:
+                period_type, period_val = detect_period_inso_style(sub if sub != "." else "")
+            except Exception as e:
+                skip_cnt += 1
+                skip_reasons["ERROR"] += 1
+                w("=" * 70)
+                w(f"SKIP Zeitraum konnte nicht erkannt werden | {sub_label}")
+                w(f"Fehler: {e}")
+                continue
+        else:
+            raise ValueError(f"period_mode unbekannt: {period_mode}")
+
+        # rules loop
+        for rsec in selected_rules:
+            r = cfg[rsec]
+            group, rid = parse_rule_section_name(rsec)
+
+            # Rule enabled?
+            enabled = r.get("enabled", "1").strip().lower() in ("1", "true", "yes", "on", "")
+            if not enabled:
+                skip_cnt += 1
+                skip_reasons["RULE_DISABLED"] += 1
+                w("=" * 70)
+                w(f"SKIP {rsec} | deaktiviert (enabled=0) | Ordner: {sub_label}")
+                continue
+
+            skip_auto = r.get("skip_in_automation", "0").strip().lower() in ("1", "true", "yes", "on")
+            if skip_auto:
+                skip_cnt += 1
+                skip_reasons["RULE_SKIPPED"] += 1
+                w("=" * 70)
+                w(f"SKIP {rsec} | skip_in_automation=1 | Ordner: {sub_label}")
+                continue
+
+            r_period_type = r.get("period_type", "").strip().upper()
+            if period_mode != "none" and r_period_type and r_period_type != period_type:
+                continue
+
+            token = r.get("token", "").strip() or group_token(group)
+            key_fallback = r.get("key_fallback", key_fallback_profile).strip().lower()
+
+            filea_t = r.get("filea", "").strip()
+            fileb_t = r.get("fileb", "").strip()
+            if not filea_t or not fileb_t:
+                skip_cnt += 1
+                skip_reasons["ERROR"] += 1
+                w("=" * 70)
+                w(f"SKIP Rule unvollständig | {rsec}")
+                continue
+
+            # resolver settings per side
+            apply_a = (glob_apply_to in ("a_only", "both"))
+            apply_b = (glob_apply_to in ("b_only", "both"))
+
+            mode_a = file_resolve_mode if apply_a else "exact_only"
+            mode_b = file_resolve_mode if apply_b else "exact_only"
+
+            ra = resolve_file(left_dir, filea_t, period_val, token, mode_a, glob_policy, glob_patterns)
+            rb = resolve_file(right_dir, fileb_t, period_val, token, mode_b, glob_policy, glob_patterns)
+
+            if ra.status in ("MISSING", "AMBIGUOUS") or rb.status in ("MISSING", "AMBIGUOUS"):
+                skip_cnt += 1
+                if ra.status == "AMBIGUOUS" or rb.status == "AMBIGUOUS":
+                    skip_reasons["AMBIGUOUS"] += 1
+                else:
+                    skip_reasons["FILE_MISSING"] += 1
+
+                w("=" * 70)
+                w(f"SKIP {rsec} | Zeitraum: {period_type} {period_val} | Ordner: {sub_label}")
+                w(f"A resolve: {ra.status} | pattern: {ra.pattern}")
+                if ra.hits:
+                    w(f"A hits: {', '.join(ra.hits[:10])}" + (" ..." if len(ra.hits) > 10 else ""))
+                w(f"B resolve: {rb.status} | pattern: {rb.pattern}")
+                if rb.hits:
+                    w(f"B hits: {', '.join(rb.hits[:10])}" + (" ..." if len(rb.hits) > 10 else ""))
+                continue
+
+            # gather compare params
+            sheeta = r.get("sheeta", "1")
+            sheetb = r.get("sheetb", "1")
+            keya = r.get("keya", "A")
+            keyb = r.get("keyb", "A")
+            colsa = r.get("colsa", "B:K")
+            colsb = r.get("colsb", "B:K")
+            starta = r.get("starta", "1")
+            enda = r.get("enda", "1")
+            startb = r.get("startb", "1")
+            endb = r.get("endb", "1")
+
+            # run compare (existing core)
+            single_report = ""
+            try:
+                single_report, meta = run_compare_with_meta(
+                    ra.path, rb.path,
+                    sheeta, keya, colsa, starta, enda,
+                    sheetb, keyb, colsb, startb, endb,
+                    key_fallback=key_fallback,
+                )
+                lines = read_report_lines(single_report)
+                is_ok = any("Beide Datenbereiche sind identisch." in ln for ln in lines)
+
+                w("=" * 70)
+                w(f"RULE {rsec} | Zeitraum: {period_type} {period_val} | Ordner: {sub_label}")
+                w(f"A: {os.path.basename(ra.path)} | Blatt: {sheeta} | resolve: {ra.status} | pattern: {ra.pattern}")
+                w(f"B: {os.path.basename(rb.path)} | Blatt: {sheetb} | resolve: {rb.status} | pattern: {rb.pattern}")
+                w(f"Konfig: A key={keya} cols={colsa} rows={starta}-{enda} | B key={keyb} cols={colsb} rows={startb}-{endb}")
+                if key_fallback == "row_number":
+                    a_fb = meta.get("A_fallback_rows", []) or []
+                    b_fb = meta.get("B_fallback_rows", []) or []
+                    w(f"Fallback-Key-Zeilen A: {len(a_fb)}, B: {len(b_fb)}")
+
+                if is_ok:
+                    ok_cnt += 1
+                    w("Ergebnis: OK")
+                else:
+                    abw_cnt += 1
+                    w("Ergebnis: ABWEICHUNG")
+                    if key_fallback == "row_number":
+                        a_fb = meta.get("A_fallback_rows", []) or []
+                        b_fb = meta.get("B_fallback_rows", []) or []
+                        if a_fb:
+                            w("Fallback-Zeilen A: " + ", ".join(map(str, a_fb[:30])) + (" ..." if len(a_fb) > 30 else ""))
+                        if b_fb:
+                            w("Fallback-Zeilen B: " + ", ".join(map(str, b_fb[:30])) + (" ..." if len(b_fb) > 30 else ""))
+                    detail = extract_detail_from_single_report(lines, report_max_detail_lines)
+                    for dl in detail:
+                        w(dl)
+
+            except Exception as e:
+                skip_cnt += 1
+                skip_reasons["ERROR"] += 1
+                w("=" * 70)
+                w(f"SKIP {rsec} | Fehler beim Vergleich | Ordner: {sub_label}")
+                w(f"Fehler: {e}")
+            finally:
+                # aggregate_only: Einzelreport immer löschen (intern genutzt)
+                if single_report:
+                    try:
+                        os.remove(single_report)
+                    except Exception:
+                        pass
+
+    # footer summary
+    dt = time.time() - t0
+    w("")
+    w("#" * 70)
+    w("SUMMARY")
+    w(f"OK: {ok_cnt}")
+    w(f"ABWEICHUNG: {abw_cnt}")
+    w(f"SKIP: {skip_cnt}")
+    w(
+        "SKIP Gründe: "
+        f"folder_missing={skip_reasons['FOLDER_MISSING']}, "
+        f"file_missing={skip_reasons['FILE_MISSING']}, "
+        f"ambiguous={skip_reasons['AMBIGUOUS']}, "
+        f"rule_disabled={skip_reasons['RULE_DISABLED']}, "
+        f"rule_skipped={skip_reasons['RULE_SKIPPED']}, "
+        f"error={skip_reasons['ERROR']}"
+    )
+    w(f"Laufzeit: {dt:.1f}s")
+    w(f"INI: {ini_path}")
+    return out_path
 
     for sub in left_subs:
         # Ordner-Matching rechts
@@ -839,6 +1062,7 @@ def run_compare(
     fileA_path: str, fileB_path: str,
     sheetA_spec: str, keyA: str, colsA_spec: str, startA: str, endA: str,
     sheetB_spec: str, keyB: str, colsB_spec: str, startB: str, endB: str,
+    key_fallback: str = "none",  # none | row_number
 ):
     bootlog("START run_compare")
 
@@ -864,8 +1088,8 @@ def run_compare(
     rsA, reA = int(startA), int(endA)
     rsB, reB = int(startB), int(endB)
 
-    A = read_block(fileA_path, sheetA_spec, keyA, colsA, rsA, reA)
-    B = read_block(fileB_path, sheetB_spec, keyB, colsB, rsB, reB)
+    A = read_block(fileA_path, sheetA_spec, keyA, colsA, rsA, reA, key_fallback=key_fallback)
+    B = read_block(fileB_path, sheetB_spec, keyB, colsB, rsB, reB, key_fallback=key_fallback)
 
     nvals = len(colsA)
     m = compare_blocks(A, B, nvals=nvals)
@@ -883,6 +1107,60 @@ def run_compare(
     )
 
     return out_txt
+
+
+
+def run_compare_with_meta(
+    fileA_path: str, fileB_path: str,
+    sheetA_spec: str, keyA: str, colsA_spec: str, startA: str, endA: str,
+    sheetB_spec: str, keyB: str, colsB_spec: str, startB: str, endB: str,
+    key_fallback: str = "none",
+) -> tuple[str, dict]:
+    """
+    Wie run_compare, aber liefert zusätzlich Meta-Infos zurück (u.a. Fallback-Key-Zeilen).
+    """
+    if not fileA_path or not os.path.exists(fileA_path):
+        raise ValueError("Datei A fehlt oder existiert nicht.")
+    if not fileB_path or not os.path.exists(fileB_path):
+        raise ValueError("Datei B fehlt oder existiert nicht.")
+
+    keyA = keyA.strip().upper()
+    keyB = keyB.strip().upper()
+    _ = col_to_index(keyA)
+    _ = col_to_index(keyB)
+
+    colsA = parse_cols_spec(colsA_spec)
+    colsB = parse_cols_spec(colsB_spec)
+    if len(colsA) != len(colsB):
+        raise ValueError("Vergleichsspalten müssen gleich viele Spalten haben (A und B).")
+
+    rsA, reA = int(startA), int(endA)
+    rsB, reB = int(startB), int(endB)
+
+    A = read_block(fileA_path, sheetA_spec, keyA, colsA, rsA, reA, key_fallback=key_fallback)
+    B = read_block(fileB_path, sheetB_spec, keyB, colsB, rsB, reB, key_fallback=key_fallback)
+
+    nvals = len(colsA)
+    m = compare_blocks(A, B, nvals=nvals)
+
+    sheetA_name = A.attrs.get("sheet_name", sheetA_spec)
+    sheetB_name = B.attrs.get("sheet_name", sheetB_spec)
+
+    out_txt = safe_write_path(make_report_filename(sheet_b_name=sheetB_name))
+
+    write_text_report(
+        m=m,
+        out_txt_path=out_txt,
+        fileA=os.path.basename(fileA_path), sheetA=sheetA_name, keyA=keyA, colsA=colsA, rsA=rsA, reA=reA,
+        fileB=os.path.basename(fileB_path), sheetB=sheetB_name, keyB=keyB, colsB=colsB, rsB=rsB, reB=reB,
+    )
+
+    meta = {
+        "A_fallback_rows": A.attrs.get("fallback_rows", []) or [],
+        "B_fallback_rows": B.attrs.get("fallback_rows", []) or [],
+        "key_fallback": A.attrs.get("key_fallback", "none"),
+    }
+    return out_txt, meta
 
 
 # ================== GUI ==================
@@ -1077,6 +1355,112 @@ def main_gui():
             status.set(f"Fehler: {e}")
 
 
+    def _rules_for_profile(automation_sec: str) -> list[str]:
+        if automation_sec not in cfg:
+            return []
+        asec = cfg[automation_sec]
+        groups = _split_list(asec.get("rule_groups", ""))
+        if not groups:
+            return []
+        out = []
+        for rsec in list_rule_sections(cfg):
+            g, _id = parse_rule_section_name(rsec)
+            if g in groups:
+                out.append(rsec)
+        return sorted(out)
+
+    def open_rules_editor(automation_sec: str):
+        # Rule-Übersicht: Gruppe | Regel | Aktiv | Auto-Skip
+        rules = _rules_for_profile(automation_sec)
+        if not rules:
+            messagebox.showinfo("Regeln", "Keine Regeln für dieses Profil gefunden.")
+            return
+
+        win = tk.Toplevel(root)
+        win.title("Regeln bearbeiten")
+        win.transient(root)
+
+        ttk.Label(win, text=f"Profil: {automation_display_name(cfg, automation_sec)}").grid(row=0, column=0, padx=10, pady=(10,4), sticky="w")
+
+        cols = ("group", "rid", "enabled", "skip")
+        tv = ttk.Treeview(win, columns=cols, show="headings", height=18)
+        tv.grid(row=1, column=0, padx=10, pady=10, sticky="nsew")
+
+        tv.heading("group", text="Gruppe")
+        tv.heading("rid", text="Regel")
+        tv.heading("enabled", text="Regel aktiv")
+        tv.heading("skip", text="In Automatik überspringen")
+
+        tv.column("group", width=160, anchor="w")
+        tv.column("rid", width=200, anchor="w")
+        tv.column("enabled", width=110, anchor="center")
+        tv.column("skip", width=170, anchor="center")
+
+        def mark(b: bool) -> str:
+            return "☑" if b else "☐"
+
+        def bool_from_ini(v: str, default: bool) -> bool:
+            if v is None:
+                return default
+            s = str(v).strip().lower()
+            if s in ("1", "true", "yes", "on"):
+                return True
+            if s in ("0", "false", "no", "off"):
+                return False
+            return default
+
+        # map iid -> rule section
+        iid_to_rsec: dict[str, str] = {}
+        for rsec in rules:
+            g, rid = parse_rule_section_name(rsec)
+            r = cfg[rsec]
+            en = bool_from_ini(r.get("enabled", "1"), True)
+            sk = bool_from_ini(r.get("skip_in_automation", "0"), False)
+            iid = tv.insert("", "end", values=(g, rid, mark(en), mark(sk)))
+            iid_to_rsec[iid] = rsec
+
+        def toggle_cell(iid: str, colname: str):
+            if iid not in iid_to_rsec:
+                return
+            rsec = iid_to_rsec[iid]
+            r = cfg[rsec]
+            vals = list(tv.item(iid, "values"))
+
+            if colname == "enabled":
+                cur = vals[2] == "☑"
+                newv = not cur
+                vals[2] = mark(newv)
+                r["enabled"] = "1" if newv else "0"
+
+            elif colname == "skip":
+                cur = vals[3] == "☑"
+                newv = not cur
+                vals[3] = mark(newv)
+                r["skip_in_automation"] = "1" if newv else "0"
+
+            tv.item(iid, values=tuple(vals))
+            save_ini(cfg, ini_path)
+
+        def on_click(event):
+            iid = tv.identify_row(event.y)
+            col = tv.identify_column(event.x)  # '#1'..'#4'
+            if not iid or not col:
+                return
+            if col == "#3":
+                toggle_cell(iid, "enabled")
+            elif col == "#4":
+                toggle_cell(iid, "skip")
+
+        tv.bind("<Button-1>", on_click)
+
+        ttk.Label(
+            win,
+            text="Hinweis: Klick auf ☑/☐ toggelt. Änderungen werden sofort in die INI geschrieben.",
+        ).grid(row=2, column=0, padx=10, pady=(0,10), sticky="w")
+
+        win.columnconfigure(0, weight=1)
+        win.rowconfigure(1, weight=1)
+
     def start_automation_dialog():
         start_root = filedialog.askdirectory(title="Startordner wählen (z.B. ...\\2025-12)")
         if not start_root:
@@ -1101,19 +1485,27 @@ def main_gui():
         combo = ttk.Combobox(win, textvariable=sel, values=names, state="readonly", width=40)
         combo.grid(row=0, column=1, padx=10, pady=10, sticky="w")
 
+        def chosen_sec() -> str:
+            chosen_name = sel.get()
+            for nm, sec in items:
+                if nm == chosen_name:
+                    return sec
+            return ""
+
+        def open_rules():
+            sec = chosen_sec()
+            if not sec:
+                messagebox.showerror("Regeln", "Profil nicht gewählt/gefunden.")
+                return
+            open_rules_editor(sec)
+
         def run_now():
             try:
-                chosen_name = sel.get()
-                chosen_sec = None
-                for nm, sec in items:
-                    if nm == chosen_name:
-                        chosen_sec = sec
-                        break
-                if not chosen_sec:
+                sec = chosen_sec()
+                if not sec:
                     messagebox.showerror("Automatik", "Profil nicht gewählt/gefunden.")
                     return
-
-                out_txt = run_automation(cfg, ini_path, chosen_sec, start_root)
+                out_txt = run_automation(cfg, ini_path, sec, start_root)
                 messagebox.showinfo("Fertig", f"Sammelprotokoll:\n{out_txt}")
                 status.set(f"AUTOMATIK OK: {out_txt}")
                 win.destroy()
@@ -1121,10 +1513,9 @@ def main_gui():
                 messagebox.showerror("Fehler", str(e))
                 status.set(f"AUTOMATIK Fehler: {e}")
 
-        ttk.Button(win, text="Start", command=run_now).grid(row=1, column=0, padx=10, pady=10, sticky="w")
-        ttk.Button(win, text="Abbrechen", command=win.destroy).grid(row=1, column=1, padx=10, pady=10, sticky="e")
-
-
+        ttk.Button(win, text="Regeln…", command=open_rules).grid(row=1, column=0, padx=10, pady=(0,10), sticky="w")
+        ttk.Button(win, text="Start", command=run_now).grid(row=1, column=1, padx=10, pady=(0,10), sticky="e")
+        ttk.Button(win, text="Abbrechen", command=win.destroy).grid(row=2, column=1, padx=10, pady=(0,10), sticky="e")
     ttk.Button(frm, text="Start Vergleich", command=on_start).grid(column=0, row=14, sticky="w")
     ttk.Button(frm, text="Automatik starten…", command=start_automation_dialog).grid(column=1, row=14, sticky="w", padx=(8,0))
     ttk.Button(frm, text="Beenden", command=root.destroy).grid(column=2, row=14, sticky="w", padx=(8,0))
@@ -1135,4 +1526,3 @@ def main_gui():
 
 if __name__ == "__main__":
     main_gui()
-

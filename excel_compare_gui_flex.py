@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-__version__ = "2.0.5"
+__version__ = "1.0.0"
 __build_date__ = "2026-02-10"
 
 
@@ -1647,3 +1647,4 @@ def main_gui():
 
 if __name__ == "__main__":
     main_gui()
+

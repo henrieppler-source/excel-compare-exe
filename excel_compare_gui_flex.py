@@ -1,3 +1,4 @@
+import os
 import sys
 import glob
 from datetime import datetime
@@ -12,7 +13,7 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-__version__ = "0.0.3"
+__version__ = "2.0.5"
 __build_date__ = "2026-02-10"
 
 
@@ -126,13 +127,13 @@ def read_block(
     compare_cols: list[str],
     row_start_excel: int,
     row_end_excel: int,
-    key_fallback: str = "none",  # none | row_number
+    key_fallback: str = "none",  # none | excel_row | block_row
 ) -> pd.DataFrame:
     """
     Fixes:
     1) Kein Spaltenversatz (keine _iloc-Spalte vor den Daten bei Spaltenauswahl).
     2) Kein Index-Mismatch beim concat (block_df wird reset_index(drop=True) + Excel-Zeilen separat).
-    3) Optional: key_fallback=row_number -> wenn Schlüsselzelle leer ist, wird ROW:<ExcelZeile> als Schlüssel gesetzt.
+    3) Optional: key_fallback=excel_row -> wenn Schlüsselzelle leer ist, wird ROW:<ExcelZeile> als Schlüssel gesetzt.
     """
     key_col = key_col.strip().upper()
     compare_cols = [c.strip().upper() for c in compare_cols]
@@ -191,15 +192,27 @@ def read_block(
     out = pd.concat([pd.Series(excel_rows, name="_excel_row"), data], axis=1)
 
     # key fallback (optional)
-    fallback_rows: list[int] = []
-    if key_fallback == "row_number":
+    fallback_rows_excel: list[int] = []
+    fallback_rows_rel: list[int] = []
+    # backward compatible aliases
+    if key_fallback in ("row_number", "rownumber", "row"):
+        key_fallback = "excel_row"
+
+    if key_fallback in ("excel_row", "block_row"):
         mask = out[key_col] == ""
         if mask.any():
-            fallback_rows = out.loc[mask, "_excel_row"].astype(int).tolist()
-            out.loc[mask, key_col] = "ROW:" + out.loc[mask, "_excel_row"].astype(int).astype(str)
+            fallback_rows_excel = out.loc[mask, "_excel_row"].astype(int).tolist()
+            if key_fallback == "excel_row":
+                out.loc[mask, key_col] = "ROW:" + out.loc[mask, "_excel_row"].astype(int).astype(str)
+            else:
+                # relative to the configured block start row (1..n within start..end)
+                rel = (out.loc[mask, "_excel_row"].astype(int) - int(rs) + 1)
+                fallback_rows_rel = rel.astype(int).tolist()
+                out.loc[mask, key_col] = "R:" + rel.astype(int).astype(str)
 
     # drop empty key (only if fallback disabled)
-    if key_fallback != "row_number":
+    if key_fallback not in ("excel_row", "block_row"):
+
         out = out[out[key_col] != ""].copy()
 
     # occurrence per key (order-sensitive!)
@@ -219,7 +232,9 @@ def read_block(
     out.attrs["key_col"] = key_col
     out.attrs["compare_cols"] = compare_cols
     out.attrs["key_fallback"] = key_fallback
-    out.attrs["fallback_rows"] = fallback_rows
+    out.attrs["fallback_rows"] = fallback_rows_excel
+    out.attrs["fallback_rows_excel"] = fallback_rows_excel
+    out.attrs["fallback_rows_rel"] = fallback_rows_rel
     return out
 
 
@@ -302,6 +317,11 @@ def write_text_report(
     out_txt_path: str,
     fileA: str, sheetA: str, keyA: str, colsA: list[str], rsA: int, reA: int,
     fileB: str, sheetB: str, keyB: str, colsB: list[str], rsB: int, reB: int,
+    key_fallback_mode: str = "none",
+    fallback_rows_a_excel: Optional[list[int]] = None,
+    fallback_rows_b_excel: Optional[list[int]] = None,
+    fallback_abw_a_excel: Optional[list[int]] = None,
+    fallback_abw_b_excel: Optional[list[int]] = None,
 ):
     any_problem = (m["STATUS"] != "OK").any()
 
@@ -312,6 +332,27 @@ def write_text_report(
     lines.append(f"A: {fileA} | Blatt: {sheetA} | Key: {keyA} | Spalten: {','.join(colsA)} | Zeilen: {rsA}-{reA}")
     lines.append(f"B: {fileB} | Blatt: {sheetB} | Key: {keyB} | Spalten: {','.join(colsB)} | Zeilen: {rsB}-{reB}")
     lines.append("")
+    # Key-Fallback info (optional)
+    mode = (key_fallback_mode or "none").strip().lower()
+    if mode in ("row_number", "rownumber", "row"):
+        mode = "excel_row"
+    a_rows = fallback_rows_a_excel or []
+    b_rows = fallback_rows_b_excel or []
+    if mode != "none":
+        lines.append(f"Key-Fallback: {mode}")
+        lines.append(f"Fallback-Key-Zeilen A: {len(a_rows)}, B: {len(b_rows)}")
+        if any_problem:
+            a_abw = fallback_abw_a_excel or []
+            b_abw = fallback_abw_b_excel or []
+            if a_abw or b_abw:
+                # limit list length to keep reports readable
+                def _fmt(nums):
+                    nums = sorted(set(int(x) for x in nums))
+                    if len(nums) > 30:
+                        return ", ".join(map(str, nums[:30])) + ", ..."
+                    return ", ".join(map(str, nums))
+                lines.append(f"Fallback-Zeilen mit ABW (Excel): A[{_fmt(a_abw)}] | B[{_fmt(b_abw)}]")
+        lines.append("")
 
     if not any_problem:
         lines.append("Beide Datenbereiche sind identisch.")
@@ -654,7 +695,7 @@ def run_automation(cfg: configparser.ConfigParser, ini_path: str, automation_sec
     if not glob_patterns:
         glob_patterns = ["{TEMPLATE}"]
 
-    key_fallback_profile = asec.get("key_fallback", "none").strip().lower()  # none | row_number
+    key_fallback_profile = asec.get("key_fallback", "none").strip().lower()  # none | excel_row | block_row
 
     # locate roots
     left_abs = os.path.join(start_root, left_root)
@@ -786,6 +827,14 @@ def run_automation(cfg: configparser.ConfigParser, ini_path: str, automation_sec
 
             token = r.get("token", "").strip() or group_token(group)
             key_fallback = r.get("key_fallback", key_fallback_profile).strip().lower()
+            if key_fallback in ("", "default"):
+                key_fallback = key_fallback_profile
+            key_fallback = (key_fallback or "none").strip().lower()
+            if key_fallback in ("row_number", "rownumber", "row"):
+                key_fallback = "excel_row"
+            if key_fallback not in ("none", "excel_row", "block_row"):
+                key_fallback = "none"
+
 
             filea_t = r.get("filea", "").strip()
             fileb_t = r.get("fileb", "").strip()
@@ -852,7 +901,7 @@ def run_automation(cfg: configparser.ConfigParser, ini_path: str, automation_sec
                 w(f"A: {os.path.basename(ra.path)} | Blatt: {sheeta} | resolve: {ra.status} | pattern: {ra.pattern}")
                 w(f"B: {os.path.basename(rb.path)} | Blatt: {sheetb} | resolve: {rb.status} | pattern: {rb.pattern}")
                 w(f"Konfig: A key={keya} cols={colsa} rows={starta}-{enda} | B key={keyb} cols={colsb} rows={startb}-{endb}")
-                if key_fallback == "row_number":
+                if meta.get("key_fallback", "none") in ("excel_row", "block_row"):
                     a_fb = meta.get("A_fallback_rows", []) or []
                     b_fb = meta.get("B_fallback_rows", []) or []
                     w(f"Fallback-Key-Zeilen A: {len(a_fb)}, B: {len(b_fb)}")
@@ -863,13 +912,16 @@ def run_automation(cfg: configparser.ConfigParser, ini_path: str, automation_sec
                 else:
                     abw_cnt += 1
                     w("Ergebnis: ABWEICHUNG")
-                    if key_fallback == "row_number":
-                        a_fb = meta.get("A_fallback_rows", []) or []
-                        b_fb = meta.get("B_fallback_rows", []) or []
-                        if a_fb:
-                            w("Fallback-Zeilen A: " + ", ".join(map(str, a_fb[:30])) + (" ..." if len(a_fb) > 30 else ""))
-                        if b_fb:
-                            w("Fallback-Zeilen B: " + ", ".join(map(str, b_fb[:30])) + (" ..." if len(b_fb) > 30 else ""))
+                    if meta.get("key_fallback", "none") in ("excel_row", "block_row"):
+                        a_abw = meta.get("A_fallback_abw_rows", []) or []
+                        b_abw = meta.get("B_fallback_abw_rows", []) or []
+                        if a_abw or b_abw:
+                            def _fmt(nums):
+                                nums = sorted(set(int(x) for x in nums))
+                                if len(nums) > 30:
+                                    return ", ".join(map(str, nums[:30])) + ", ..."
+                                return ", ".join(map(str, nums))
+                            w(f"Fallback-Zeilen mit ABW (Excel): A[{_fmt(a_abw)}] | B[{_fmt(b_abw)}]")
                     detail = extract_detail_from_single_report(lines, report_max_detail_lines)
                     for dl in detail:
                         w(dl)
@@ -1002,10 +1054,16 @@ def run_automation(cfg: configparser.ConfigParser, ini_path: str, automation_sec
             endb = r.get("endb", "1")
 
             try:
+                # key-fallback: rule override > profile default
+                kf = (r.get("key_fallback", "").strip().lower() or key_fallback_profile).strip().lower()
+                if kf in ("row_number", "rownumber", "row"):
+                    kf = "excel_row"
+
                 single_report = run_compare(
                     ra.path, rb.path,
                     sheeta, keya, colsa, starta, enda,
                     sheetb, keyb, colsb, startb, endb,
+                    key_fallback=kf,
                 )
                 lines = read_report_lines(single_report)
                 is_ok = any("Beide Datenbereiche sind identisch." in ln for ln in lines)
@@ -1015,6 +1073,11 @@ def run_automation(cfg: configparser.ConfigParser, ini_path: str, automation_sec
                 w(f"A: {os.path.basename(ra.path)} | Blatt: {sheeta} | resolve: {ra.status} | pattern: {ra.pattern}")
                 w(f"B: {os.path.basename(rb.path)} | Blatt: {sheetb} | resolve: {rb.status} | pattern: {rb.pattern}")
                 w(f"Konfig: A key={keya} cols={colsa} rows={starta}-{enda} | B key={keyb} cols={colsb} rows={startb}-{endb}")
+
+                # Key-Fallback lines from single report (for transparency)
+                kb = [ln for ln in lines if ln.startswith("Key-Fallback:") or ln.startswith("Fallback-Key-Zeilen")]
+                for ln in kb:
+                    w(ln)
 
                 if is_ok:
                     ok_cnt += 1
@@ -1062,7 +1125,7 @@ def run_compare(
     fileA_path: str, fileB_path: str,
     sheetA_spec: str, keyA: str, colsA_spec: str, startA: str, endA: str,
     sheetB_spec: str, keyB: str, colsB_spec: str, startB: str, endB: str,
-    key_fallback: str = "none",  # none | row_number
+    key_fallback: str = "none",  # none | excel_row | block_row
 ):
     bootlog("START run_compare")
 
@@ -1097,6 +1160,30 @@ def run_compare(
     sheetA_name = A.attrs.get("sheet_name", sheetA_spec)
     sheetB_name = B.attrs.get("sheet_name", sheetB_spec)
 
+    # key-fallback metadata (for reporting)
+    mode = (key_fallback or "none").strip().lower()
+    if mode in ("row_number", "rownumber", "row"):
+        mode = "excel_row"
+    if mode not in ("none", "excel_row", "block_row"):
+        mode = "none"
+
+    fb_a = A.attrs.get("fallback_rows_excel") or A.attrs.get("fallback_rows") or []
+    fb_b = B.attrs.get("fallback_rows_excel") or B.attrs.get("fallback_rows") or []
+
+    fb_abw_a: list[int] = []
+    fb_abw_b: list[int] = []
+    try:
+        if "_key2" in m.columns:
+            mask_fb = m["_key2"].astype(str).str.startswith(("ROW:", "R:"))
+            mask_abw = m["STATUS"].astype(str) == "ABWEICHUNG"
+            sel = m[mask_fb & mask_abw].copy()
+            if "_excel_row_A" in sel.columns:
+                fb_abw_a = [int(x) for x in sel["_excel_row_A"].dropna().tolist()]
+            if "_excel_row_B" in sel.columns:
+                fb_abw_b = [int(x) for x in sel["_excel_row_B"].dropna().tolist()]
+    except Exception:
+        pass
+
     out_txt = safe_write_path(make_report_filename(sheet_b_name=sheetB_name))
 
     write_text_report(
@@ -1104,11 +1191,14 @@ def run_compare(
         out_txt_path=out_txt,
         fileA=os.path.basename(fileA_path), sheetA=sheetA_name, keyA=keyA, colsA=colsA, rsA=rsA, reA=reA,
         fileB=os.path.basename(fileB_path), sheetB=sheetB_name, keyB=keyB, colsB=colsB, rsB=rsB, reB=reB,
+        key_fallback_mode=mode,
+        fallback_rows_a_excel=fb_a,
+        fallback_rows_b_excel=fb_b,
+        fallback_abw_a_excel=fb_abw_a,
+        fallback_abw_b_excel=fb_abw_b,
     )
 
     return out_txt
-
-
 
 def run_compare_with_meta(
     fileA_path: str, fileB_path: str,
@@ -1146,6 +1236,29 @@ def run_compare_with_meta(
     sheetA_name = A.attrs.get("sheet_name", sheetA_spec)
     sheetB_name = B.attrs.get("sheet_name", sheetB_spec)
 
+    mode = (key_fallback or "none").strip().lower()
+    if mode in ("row_number", "rownumber", "row"):
+        mode = "excel_row"
+    if mode not in ("none", "excel_row", "block_row"):
+        mode = "none"
+
+    fb_a = A.attrs.get("fallback_rows_excel") or A.attrs.get("fallback_rows") or []
+    fb_b = B.attrs.get("fallback_rows_excel") or B.attrs.get("fallback_rows") or []
+
+    fb_abw_a: list[int] = []
+    fb_abw_b: list[int] = []
+    try:
+        if "_key2" in m.columns:
+            mask_fb = m["_key2"].astype(str).str.startswith(("ROW:", "R:"))
+            mask_abw = m["STATUS"].astype(str) == "ABWEICHUNG"
+            sel = m[mask_fb & mask_abw].copy()
+            if "_excel_row_A" in sel.columns:
+                fb_abw_a = [int(x) for x in sel["_excel_row_A"].dropna().tolist()]
+            if "_excel_row_B" in sel.columns:
+                fb_abw_b = [int(x) for x in sel["_excel_row_B"].dropna().tolist()]
+    except Exception:
+        pass
+
     out_txt = safe_write_path(make_report_filename(sheet_b_name=sheetB_name))
 
     write_text_report(
@@ -1153,17 +1266,25 @@ def run_compare_with_meta(
         out_txt_path=out_txt,
         fileA=os.path.basename(fileA_path), sheetA=sheetA_name, keyA=keyA, colsA=colsA, rsA=rsA, reA=reA,
         fileB=os.path.basename(fileB_path), sheetB=sheetB_name, keyB=keyB, colsB=colsB, rsB=rsB, reB=reB,
+        key_fallback_mode=mode,
+        fallback_rows_a_excel=fb_a,
+        fallback_rows_b_excel=fb_b,
+        fallback_abw_a_excel=fb_abw_a,
+        fallback_abw_b_excel=fb_abw_b,
     )
 
     meta = {
-        "A_fallback_rows": A.attrs.get("fallback_rows", []) or [],
-        "B_fallback_rows": B.attrs.get("fallback_rows", []) or [],
-        "key_fallback": A.attrs.get("key_fallback", "none"),
+        "key_fallback": mode,
+        "A_fallback_rows": fb_a,
+        "B_fallback_rows": fb_b,
+        "A_fallback_abw_rows": fb_abw_a,
+        "B_fallback_abw_rows": fb_abw_b,
     }
     return out_txt, meta
 
 
 # ================== GUI ==================
+
 def main_gui():
     bootlog("START main_gui")
 
@@ -1526,4 +1647,3 @@ def main_gui():
 
 if __name__ == "__main__":
     main_gui()
-
